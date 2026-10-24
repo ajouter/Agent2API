@@ -1,0 +1,2577 @@
+//! 网关自身配置的读写与运行时快照。
+//!
+//! 与 Node 版 `loadConfig` / `saveConfig` / `applyConfig` 对齐（server.mjs 242-264 行）。
+//!
+//! ── 持久化：统一库的 `kv` 表（本切片从 config.json 迁过来）────────
+//! 改造前是一整份 `{config_dir}/config.json`；现在它的每个**顶层键就是 `kv`
+//! 表的一行**（键名与配置文件里的一字不差），值是该键那段 JSON 文本。
+//! 读是一次全取（跳过 `RESERVED_KV_KEYS` 里的固定键），写是一个事务里的
+//! 「逐键 UPSERT + 删掉新配置里已没有的键」。旧文件由
+//! `db::migrate::import_config` 一次性搬入。
+//!
+//! ── 「全量保留未知字段」这条不变量在库形态下怎么实现 ──────────
+//! 改造前：整个 JSON 对象是**松散**的，模块刻意不做 struct 映射，底稿一律是
+//! `serde_json::Map`；谁写盘都只能改自己那几项，写回时整份照写，**未知字段因此
+//! 从结构上不可能丢**。
+//! 进库后这条不变量**换了一种实现方式，但强度不变**：
+//!   - 读侧取**所有**非保留键（不做白名单过滤）→ `raw` 里自然带着未知键；
+//!   - 写侧按 `raw` 逐键 UPSERT → 未知键**原样写回**；
+//!   - 唯一会删除的键是「不在 `raw` 里的那些」，而 `raw` 是读出来的底稿 ——
+//!     所以「不认识的键」永远不会被删。
+//! 也就是说：**未知字段的保留不再依赖「整份照写」这个动作，而依赖「读全量 +
+//! 只删已知的缺失项」**。这条推理链是库形态下唯一保证，改动 `read_conn`
+//! 的过滤条件或 `stale_keys` 的判据都会破坏它 —— 两处都有注释指向这里。
+//! 一个具体的后果：`providerRoute` 这种**已下线但仍留在配置里**的历史键，
+//! 依然会被读出来、写回去，不会因为代码里没人再用它就消失。
+//!
+//! ── 与固定 kv 键的关系（一条硬约束）─────────────────────────
+//! 配置的顶层键**绝不能与 `db::schema::RESERVED_KV_KEYS` 相撞**：撞名的后果是
+//! 配置写入把别人的状态当成「配置里已删掉的键」删掉。当前键集合逐项核对过
+//! （结论与核对方法见 `db::schema` 模块头）。
+//!
+//! ── 运行期可变 ──────────────────────────────────────────────
+//! Node 版改了配置直接改 `opts` 对象，请求热路径不再读盘；Rust 里用
+//! `RwLock<Option<RuntimeConfig>>` 持有同一份「当前生效值」，于是
+//! POST /api/config 改完 API Key 后鉴权中间件立即生效（不重启、不读库）。
+//!
+//! 优先级：配置里的值 > 环境变量 > 内置默认值。
+//! 注意 `WORKBUDDY_PROXY_API_KEY` 是「启动时注入」语义 —— 它会写进内存快照，
+//! 但 POST /api/config 传 null 可以把它清掉（对应 Node 版 `opts.apiKey = null`）。
+//!
+//! ── 启动期时序（本模块最容易读错的一处）─────────────────────
+//! `init` 在 `bootstrap` 里**早于迁移**被调用，而且必须早：`db::migrate` 的
+//! `import_logs` / `import_requests` / `import_debug` 要读 `storage_dirs()` 与
+//! `retention_settings()`。但配置在库里、库要 `Db::open` 之后才存在 ——
+//! `read_raw` 用「库优先、必要时回落旧文件」化解这个循环，完整论证见那里的注释。
+//!
+//! ── 文件布局 ────────────────────────────────────────────────
+//! ```text
+//! server/config/
+//!   mod.rs    读写入口与内存快照（本文件）
+//!   types.rs  键名常量、各设置类型、默认值与取值范围（对外契约）
+//!   parse.rs  从 raw 底稿取值：类型判定、越界回落、环境变量兜底
+//!   sql.rs    `kv` 表的行级读写（本模块唯一出现 SQL 的地方）
+//! ```
+//!
+//! 配置目录本身（`~/.agent2api`）的事实来源在 `crate::paths::config_dir`，
+//! 本模块只做转发；从 1.x 升级上来的一次性目录迁移在 `config_migration`，
+//! 这里只保留旧目录名常量与旧目录路径访问器（`LEGACY_DIR_NAME` 仍是全仓
+//! 唯一的字面量）。
+
+use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+
+use serde_json::{Map, Value};
+
+use crate::server::db::Db;
+
+mod assistant_config;
+pub(crate) mod parse;
+pub(crate) mod sql;
+mod types;
+
+pub use assistant_config::*;
+pub use types::*;
+
+use parse::*;
+
+/// 运行期生效的配置快照。
+///
+/// 字段是「本切片真正会用到的」子集，其余未知字段留在 `raw` 里原样保留，
+/// 写盘时一起回写。
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeConfig {
+    /// 顶层旧字段 `apiKey` 的**磁盘原值**（从本轮改造起可能是 `enc1:` 信封）。
+    /// 唯一读者是 `masked_api_key`，解密也在那里 —— 为什么不在快照构建期解，
+    /// 见那个函数的说明。
+    api_key: Option<String>,
+    locale: String,
+    default_model: String,
+    last_request_model: Option<String>,
+    /// 保留期设置（只剩事件日志一项；请求日志 / 按天聚合已全量保留）。
+    ///
+    /// 为什么解析进字段而不是让调用方每次去 `raw` 里翻：保留期要被**每次写日志**
+    /// 取用（回调形式），从 `Value` 里逐个取值要处理类型不符、缺字段、范围夹紧，
+    /// 放在这里解析一次即可；`raw` 仍是写盘时的唯一底稿。
+    retention: RetentionSettings,
+    /// 六条间隔型定时任务的开关与间隔（设置页「定时任务」区域）。
+    ///
+    /// 与保留期同一理由：凭证维护与模型刷新的循环**每一轮都要重读**它
+    /// （改完设置下一轮生效，不重启进程），从 `Value` 里翻一次要处理一堆
+    /// 类型与范围判定，解析一次存下来最省事。
+    scheduled: ScheduledSettings,
+    /// 请求重试的次数与间隔（设置页「通用 → 请求重试」区域）。
+    ///
+    /// 与保留期同一理由：转发层**每次重试判定**都要取它（改完设置下一个
+    /// 失败请求就用新值，不重启进程），解析一次存下来最省事。
+    retry: RetrySettings,
+    /// 上游请求的四项超时（设置页「通用 → 请求超时」区域）。
+    ///
+    /// 与 retry 同一理由：转发层**每次发送 / 每次分片**都要取它（改完设置
+    /// 下一个请求就用新值，不重启进程），解析一次存下来最省事。
+    timeouts: TimeoutSettings,
+    /// 排队等待的次数与单次时长（设置页「通用 → 排队等待」区域）。
+    ///
+    /// 与 timeouts 同一理由：走排队制的适配器**每次遇到排队**都要取它
+    /// （改完设置下一个请求就用新值，不重启进程），解析一次存下来最省事。
+    queue: QueueSettings,
+    /// ZCode 验证码令牌池的补货节奏（设置页「网关 → 验证码令牌池」区域）。
+    ///
+    /// 与 queue 同一理由：stats 端点**每次被铸造器轮询**都要取它（改完设置
+    /// 下一轮就生效，不重启进程），解析一次存下来最省事。
+    captcha_pool: CaptchaPoolSettings,
+    /// 账号路由的策略 / 粘性 / 退避 / 垫底 / 熔断（账号页「路由」区域）。
+    ///
+    /// 与 timeouts 同一理由：转发层**每次选路**都要取它（改完设置下一个
+    /// 请求就生效，不重启进程），解析一次存下来最省事。
+    routing: RoutingSettings,
+    /// 事件日志的保存目录（原始配置值；None = 未设置，用配置目录）。
+    /// 低频字段（启动 + 设置页读写），不值得为它发明解析层，存原始值即可。
+    log_dir: Option<String>,
+    /// 请求日志的保存目录（原始配置值；None = 未设置）
+    request_stats_dir: Option<String>,
+    /// 调试模式原始报文的保存目录（原始配置值；None = 未设置）
+    debug_dir: Option<String>,
+    /// 调试模式开关（设置页「通用 → 调试模式」）。
+    ///
+    /// 与保留期同一理由：转发层**每次发送前**都要判一次（改完开关下一个请求
+    /// 就生效，不重启进程），从 `Value` 里翻一次要处理类型判定，解析一次存下来
+    /// 最省事 —— 这条判定在转发热路径上。
+    debug_mode: bool,
+    /// 出站请求体黑名单指纹脱敏开关（设置页「通用 → 指纹脱敏」）。
+    ///
+    /// 与 `debug_mode` 同一理由：转发层**每次发送前**都要判一次（改完开关下一个
+    /// 请求就生效，不重启进程），从 `Value` 里翻一次要处理类型判定，解析一次存
+    /// 下来最省事 —— 这条判定在转发热路径上。
+    sanitize_fingerprints: bool,
+    /// 开发者角色兼容开关（设置页「网关 → 开发者角色兼容」）。
+    ///
+    /// 与 `sanitize_fingerprints` 同一理由：转发层**每次发送前**都要判一次
+    /// （改完开关下一个请求就生效，不重启进程），解析一次存下来最省事。
+    /// 语义与默认值见 `KEY_DEVELOPER_ROLE_COMPAT`。
+    developer_role_compat: bool,
+    /// **Cline 转发头的逐键覆盖**（设置页「Cline 伪装头」）。
+    ///
+    /// 存的只是**用户改过的键**（覆盖表），默认值硬编码在
+    /// `core::providers::cline::headers`（与官方客户端形态对齐的那一套）。
+    /// 与 `debug_mode` 同一理由：Cline 适配器**每次构造上游请求**都要取它
+    /// （改完下一个请求就生效，不重启进程），解析一次存下来最省事。
+    /// 值语义：非空 = 按键覆盖/新增；空串 = 这个头不发（显式删除）。
+    cline_upstream_headers: std::collections::BTreeMap<String, String>,
+    /// 网关面（`/v1/*`）跨域访问开关（设置页「安全 → 网关跨域访问」）。
+    ///
+    /// 与 `debug_mode` 同一理由：CORS 中间件逐请求判一次（改完开关下一个请求就
+    /// 生效，不重启进程），解析一次存下来最省事。默认 `false`，见 `KEY_CORS_ENABLED`。
+    /// 只作用于网关面，面板路由不受它影响。
+    cors_enabled: bool,
+    /// AI 助手配置（设置页「AI 助手」分类：对话模型 / 系统提示词 / 工具勾选）。
+    ///
+    /// 与 `prompt` 同一模式：低频读取 + 整块进出（只有设置页与助手的对话入口取它），
+    /// 解析一次存下来即可。整块存在一个配置键下（见 `assistant_config` 模块头）。
+    assistant: AssistantConfig,
+    /// 「丢弃保活换行分片」开关（`/api/keepalive-strip`，默认关）。
+    ///
+    /// 与 `sanitize_fingerprints` 同一理由：装配下发策略时每轮都要问一次，
+    /// 解析一次存下来最省事。**它不替代能力位**：真正丢不漏是
+    /// 「适配器声明 × 本开关」两者相与（见
+    /// [`crate::server::core::upstream::sse::FramePolicy::assembled`]）。
+    strip_newline_keepalive: bool,
+    /// 「长度截断自动续写」开关（`/api/auto-continue`，默认关）。
+    ///
+    /// 与 `strip_newline_keepalive` 同一理由：转发层**每个请求**都要问一次
+    /// 「这一轮要不要包装成续写链」（改完下一个请求就生效，不重启进程），
+    /// 解析一次存下来最省事。判据与代价口径在
+    /// [`crate::server::core::upstream::continuation`]，本模块只存取开关。
+    auto_continue: bool,
+    /// 续写的轮数上限（`autoContinueMaxRounds`，默认 3、合法 1~8）。
+    ///
+    /// 与 `auto_continue` 同一理由（逐请求取一次），且**必须与开关一起解析**：
+    /// 续写链两道停机里这是那道硬保险（相似度闸是软判据），读侧越界回落默认
+    /// （不夹紧），写侧由 `api::auto_continue` 拦成 400 —— 两侧共用
+    /// `AUTO_CONTINUE_MIN/MAX_ROUNDS`。
+    ///
+    /// 出厂值只由 `build()` 给：本结构的 `Default` 是派生的，那个 0 与
+    /// `locale` / `default_model` 那两条派生的空串一样，**都不是出厂值**，
+    /// 只服务 `Debug` 与占位构造（真正读默认值请走 `auto_continue_max_rounds()`
+    /// 那条轻量读取，未初始化时它自己会走 `parse` 的兜底）。
+    auto_continue_max_rounds: i64,
+    /// 面板机器人校验开关（设置页「通用 → 机器人校验」，ALTCHA proof-of-work）。
+    ///
+    /// 与 `debug_mode` 同一理由：登录 / 注册端点逐请求判一次（改完开关下一个
+    /// 请求就生效），解析一次存下来最省事。默认 `true`，见 `KEY_CAPTCHA_ENABLED`；
+    /// 配置项缺失时可由环境变量 `AGENT2API_CAPTCHA_ENABLED` 兜底（默认 1 开、0 关）。
+    captcha_enabled: bool,
+    /// models.dev 模型元数据开关（设置页「通用 → models.dev 模型元数据」）。
+    ///
+    /// 它是「这个模型的能力/档位能不能由社区库补」的**联网**总闸，默认 `true`
+    /// （见 `KEY_MODELS_DEV_ENABLED`）。低频读取（只在模型元数据刷新发起时问
+    /// 一次），与 `captcha_enabled` 同一模式解析一次存下来。
+    models_dev_enabled: bool,
+    /// 系统提示词设置（设置页「通用 → 系统提示词」）。
+    ///
+    /// 与 `sanitize_fingerprints` 同一理由（转发层逐请求取一次，改完下一个请求
+    /// 生效），另外多一件事：**提示词文件在构造快照时就读完**（见 `prompt_from`），
+    /// 于是转发热路径上一次磁盘 IO 都没有；文件读不到时这里已经是「内置默认 +
+    /// 一条原因」的形态，转发层不必再处理失败路径。
+    prompt: PromptSettings,
+    /// 「软件更新」的出网线路（`updateProxy`：None = 直连，默认）。
+    ///
+    /// 存的是归一后的配置对象（与账号代理同一形状），解析交给
+    /// `core::proxies::resolve_account_proxy`（同一条路）。低频字段（每次
+    /// 检查 / 下载发起时读一次），不值得为它发明解析层，存原始值即可。
+    update_proxy: Option<Value>,
+    /// 「加入 beta 版」开关（`updateBeta`：缺省关）。
+    ///
+    /// 开启后更新检查改问 `/releases` 列表、自己挑一版：**当前跑 beta 版的人只看
+    /// 预发布**（同核心号的转正版不算更新，不会自动切回正式版），跑正式版的人
+    /// 预发布一并参与（仓库没有 beta 时照旧收正式版更新）。关闭时走
+    /// `/releases/latest`（GitHub 自己排除预发布）—— 且与当前版本做语义化比较，
+    /// 所以「从 beta 版关掉开关」不会被降级到更低的正式版。与 `update_proxy` 同为
+    /// 低频字段（每次检查发起时读一次），解析一次存下来 —— 判据与代价口径见
+    /// `core::update::check` 的通道分支与 `core::update::version::pick_listed_release`。
+    update_beta: bool,
+    /// 代理内核的存放目录（`kernelDir`：None = 用默认 `{config_dir}/proxy-kernel`）。
+    ///
+    /// 与 `log_dir` 同形（存原始字符串，解析时要求绝对路径），区别是**它有一个
+    /// 活着的写入口**（内核下载弹窗选目录）—— 数据目录那几个键的写入口随迁移
+    /// 一起退役了，这个键则要长期可改（内核可以放到别的盘上，几十 MB 的二进制
+    /// 与 provider 缓存没必要占系统盘）。
+    kernel_dir: Option<String>,
+    /// 代理内核的下载出网线路（`kernelProxy`：None = 默认链）。
+    ///
+    /// 与 `update_proxy` 同一形状、同一解析路径，只是**另一个键**：下载内核与
+    /// 软件更新各走各的线路，互不覆盖（理由见 `KEY_KERNEL_PROXY` 的说明）。
+    kernel_proxy: Option<Value>,
+    /// GitHub 令牌的**密文信封**（`githubToken`：None = 未在界面保存）。
+    ///
+    /// 注意这里从配置里读出来的就已经是 `enc1:` 信封，**明文永远不进
+    /// config 快照**（加解密都在 `core::update::token` 里），环境变量
+    /// 兜底也不在这里管。与 update_proxy 同为低频字段，存原始字符串即可。
+    github_token: Option<String>,
+    /// 磁盘上那份 JSON 对象（含未知字段），写盘时的全量底稿
+    raw: Map<String, Value>,
+}
+
+impl RuntimeConfig {
+    /// 是否启用了鉴权：`apiKeys` 里有启用的 Key、或旧字段 / 环境变量给了 Key
+    /// （多 Key 的解析见 `core::api_keys`）
+    pub fn api_key_set(&self) -> bool {
+        !self.active_api_keys().is_empty()
+    }
+
+    /// 当前**启用**的全部明文 Key（鉴权中间件逐把比对）；空 = 免鉴权
+    pub fn active_api_keys(&self) -> Vec<String> {
+        crate::server::core::api_keys::active_keys_from(&self.raw)
+    }
+
+    /// 计费接口语言（Accept-Language）
+    pub fn locale(&self) -> &str {
+        &self.locale
+    }
+
+    /// 默认模型
+    pub fn default_model(&self) -> &str {
+        &self.default_model
+    }
+
+    /// 最近一次实际转发的模型（账号页「模型」筛选的默认值）
+    pub fn last_request_model(&self) -> Option<&str> {
+        self.last_request_model.as_deref()
+    }
+
+    /// 调试模式是否开启（转发层每次发送前判一次，见字段说明）
+    pub fn debug_mode(&self) -> bool {
+        self.debug_mode
+    }
+
+    /// 出站指纹脱敏是否开启（转发层每次发送前判一次，见字段说明）
+    pub fn sanitize_fingerprints(&self) -> bool {
+        self.sanitize_fingerprints
+    }
+
+    /// 开发者角色兼容是否开启（转发层每次发送前判一次，见字段说明）
+    pub fn developer_role_compat(&self) -> bool {
+        self.developer_role_compat
+    }
+
+    /// 网关面（`/v1/*`）跨域访问是否开启（CORS 中间件逐请求判一次，见字段说明）
+    pub fn cors_enabled(&self) -> bool {
+        self.cors_enabled
+    }
+
+    /// 「丢弃保活换行分片」开关（与能力位相与后才生效，见字段说明）
+    pub fn strip_newline_keepalive(&self) -> bool {
+        self.strip_newline_keepalive
+    }
+
+    /// 「长度截断自动续写」开关（判据见
+    /// [`crate::server::core::upstream::continuation`]，见字段说明）
+    pub fn auto_continue(&self) -> bool {
+        self.auto_continue
+    }
+
+    /// 自动续写的轮数上限（解析时已按 `AUTO_CONTINUE_MIN_ROUNDS..=AUTO_CONTINUE_MAX_ROUNDS`
+    /// 收口，见字段说明）
+    pub fn auto_continue_max_rounds(&self) -> i64 {
+        self.auto_continue_max_rounds
+    }
+
+    /// 面板机器人校验开关（登录 / 注册端点逐请求判一次）。
+    pub fn captcha_enabled(&self) -> bool {
+        self.captcha_enabled
+    }
+
+    /// models.dev 模型元数据的**联网刷新**开关（`core::model_meta::refresh` 读）。
+    pub fn models_dev_enabled(&self) -> bool {
+        self.models_dev_enabled
+    }
+
+    /// 系统提示词设置（界面 / 日志用；转发层要的是下面的借用视图）
+    pub fn prompt_settings(&self) -> &PromptSettings {
+        &self.prompt
+    }
+
+    /// 转发层要的**提示词决定**：全局默认 + 各家覆盖的借用视图。
+    ///
+    /// 借用而不是克隆：文本可能有几百行，而本方法在**每个请求**上调用一次
+    /// （`upstream::forward` 取快照），克隆一份纯属浪费。生命周期绑在
+    /// `&self` 上 —— 调用方必须让快照活过整条转发链（见 `upstream::forward`
+    /// 里那个 `config` 局部变量的说明）。
+    pub fn prompt_plan(&self) -> crate::server::core::prompt::PromptPlan<'_> {
+        crate::server::core::prompt::PromptPlan::new(
+            crate::server::core::prompt::PromptChoice {
+                mode: self.prompt.mode,
+                text: &self.prompt.text,
+                source: self.prompt.source,
+            },
+            &self.prompt.providers,
+        )
+    }
+
+    /// 掩码后的 API Key，格式照抄 server.mjs 920 行：前 6 后 4。
+    /// 短 key 会前后重叠 —— Node 的 slice(0,6)/slice(-4) 也是这样，保持一致。
+    ///
+    /// ── 为什么在**这里**解密，而不在快照构建期或写侧 ─────────────
+    /// `apiKey` 从本轮改造起可能是 `enc1:` 信封（顶层旧字段的原地加密迁移见
+    /// `core::legacy_api_key`），所以掩码前必须先按 `api_keys` 的口径解出明文 ——
+    /// 直接掩码密文，界面上会显示成 `enc1:b...xxxx`，看起来像 Key 被换掉了。
+    /// 位置放在掩码这一层而不是 `build`：`build` 在 `config::init` 里跑，那时
+    /// 日志库还没装（见 `save_raw` 的说明），「密钥文件丢了、这把 Key 解不开」那条
+    /// 一次性降级告警只会落在控制台上（桌面形态下用户根本看不到）；本方法由界面
+    /// （GET /api/config）调用，那时日志已入库。顺带让启动极早期不做任何解密动作。
+    pub fn masked_api_key(&self) -> Option<String> {
+        let stored = self.api_key.as_ref().filter(|key| !key.is_empty())?;
+        let key = crate::server::core::api_keys::stored_plaintext(stored);
+        let head: String = key.chars().take(6).collect();
+        let total = key.chars().count();
+        let tail: String = key.chars().skip(total.saturating_sub(4)).collect();
+        Some(format!("{head}...{tail}"))
+    }
+
+    /// 原始 JSON 底稿（后续切片读自定义字段用）
+    pub fn raw(&self) -> &Map<String, Value> {
+        &self.raw
+    }
+}
+
+/// 配置目录：`paths::config_dir` 是唯一实现（桌面侧 `gateway::config_dir` 转发这里），
+/// 「壳读 key」与「服务端读 key」仍指向同一个目录，改路径只需改 paths 一处。
+pub fn config_dir() -> PathBuf {
+    crate::paths::config_dir()
+}
+
+/// config.json 的完整路径
+pub fn config_file() -> PathBuf {
+    config_dir().join("config.json")
+}
+
+/// 旧版配置目录名（仅用于一次性目录迁移）。
+///
+/// **这是全仓唯一一处允许出现 `.workbuddy-proxy` 字面量的地方** ——
+/// 别处的路径一律走 `config_dir()`（事实来源在 `gateway::config_dir`），
+/// 否则改名会出现两套口径。
+const LEGACY_DIR_NAME: &str = ".workbuddy-proxy";
+
+/// 旧版配置目录的完整路径（`{用户主目录}/.workbuddy-proxy`），供迁移使用。
+pub(crate) fn legacy_config_dir() -> PathBuf {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(LEGACY_DIR_NAME)
+}
+
+// 迁移本身（唯一入口 `config_migration::migrate_config_dir`）在
+// `server/config_migration.rs`；本模块只提供上面这个旧目录路径，
+// 保证 `.workbuddy-proxy` 字面量全仓只有一处。
+
+/// 读磁盘上残留的 `providerRoute` 覆盖值：`[(providerId, 优先级)]`，只含文件里
+/// 写了合法数字的那些键。账号存储把「按家分队」的旧号码合并成全局队列时，
+/// 用它还原旧版的实际跨家顺序（缺省的家按注册表顺序，见 `store_admin`）。
+///
+/// 直接读盘而不走内存快照：这是启动期一次性的低频调用，且账号迁移可能早于
+/// `config::init`，读盘最不依赖初始化顺序。
+pub fn legacy_provider_route() -> Vec<(String, u32)> {
+    let raw = read_raw();
+    let Some(Value::Object(table)) = raw.get(KEY_PROVIDER_ROUTE) else {
+        return Vec::new();
+    };
+    table
+        .iter()
+        .filter_map(|(id, value)| number_u32(value).map(|rank| (id.clone(), rank)))
+        .collect()
+}
+
+/// JSON 值 → u32：数字（含整值浮点）/ 数字字符串，负数与非有限值不认。
+fn number_u32(value: &Value) -> Option<u32> {
+    let number = match value {
+        Value::Number(number) => number.as_f64()?,
+        Value::String(text) => text.trim().parse::<f64>().ok()?,
+        _ => return None,
+    };
+    if !number.is_finite() || number < 0.0 {
+        return None;
+    }
+    Some(number.min(u32::MAX as f64) as u32)
+}
+
+/// 读配置底稿：优先统一库，**必要时回落旧文件**。
+///
+/// ── 为什么需要回落（时序：先有鸡还是先有蛋）─────────────────
+/// `config::init()` 在 `bootstrap` 里**早于** `Db::open` 被调用，而且它必须
+/// 早：`db::migrate` 的 `import_logs` / `import_requests` / `import_debug`
+/// 三项要读 `storage_dirs()`（旧文件的候选目录）与 `retention_settings()`
+/// （日志裁剪天数），两者都来自配置快照。顺序反了，那三项就会拿默认目录去找
+/// 旧文件（找不到 → 用户的日志永远留在旧文件里）并按默认 30 天裁一次日志
+/// （**不可逆地把长保留期的旧日志裁掉**）。所以配置快照必须在迁移之前就位。
+/// 但配置在库里，而库要 `Db::open` 之后才存在 —— 这就是那个循环。
+///
+/// 解法是**读路径分流**，不是改顺序：
+///   - `db` 已装入 → 从库读（正常路径，唯一的真相来源）；
+///   - `db` 未装入 / 库不可用 / **迁移还没跑过** → 回落读旧
+///     `{config_dir}/config.json`，与改造前的行为逐字相同。
+/// 第三条是关键：全新安装时库里没有配置，回落读到的是空对象（旧文件也不存在），
+/// 与改造前一致；老用户升级后第一次启动时，回落读到的是他真正的旧配置 ——
+/// 于是迁移项还没跑，快照里已经是正确的值，日志裁剪天数、旧文件目录全都对。
+/// 迁移把旧文件搬进库并改名成 `.migrated` 之后，回落这一路自然失效
+/// （文件没了），下次启动就走库那条路。
+///
+/// 为什么用「标记键」而不是「库里有没有配置键」判断要不要回落：运行期写一次
+/// 配置就会让库里出现配置键，但**迁移还没跑**（旧文件里可能还有别的键没搬完）。
+/// 标记键与迁移数据在同一个事务里落（见 `sql::import_conn`），所以「标记在」
+/// 等价于「这份旧文件已经完整导入过」，是唯一可靠的判据。
+fn read_raw() -> Map<String, Value> {
+    if let Some(db) = db() {
+        if let Some((raw, migrated)) = sql::read_snapshot(&db) {
+            // 迁移未完成：库里可能只有运行期写的零星几项，其余仍在旧文件里，
+            // 因此两份都要（旧文件里的项优先，它是用户完整的旧配置）。
+            // 迁移完成后（标记在）就以库为唯一真相，不再看文件。
+            if migrated {
+                return raw;
+            }
+            return merge_legacy(raw);
+        }
+    }
+    // 库读不出来（未装入 / 锁中毒 / SQL 出错）：回落旧文件，与改造前一致。
+    // 不在这里报错：这个函数在启动极早期就会被调用，而调用方（`init`）
+    // 已经能通过 `db()` 是否为空判断降级状态。
+    read_legacy_file()
+}
+
+/// 读旧 `{config_dir}/config.json`（缺失 / 损坏 / 类型不符都当空对象，
+/// 对应 Node 版 `loadConfig` 的 catch 分支）。
+///
+/// 只在两种情形被走到：`db` 未装入（启动极早期 / 库打不开），以及迁移尚未
+/// 完成（此时它是用户完整旧配置的所在）。迁移完成后这个文件已被改名成
+/// `.migrated`，本函数读不到东西 —— 那正是「不该再看它」的表达方式。
+fn read_legacy_file() -> Map<String, Value> {
+    let Ok(text) = std::fs::read_to_string(config_file()) else {
+        return Map::new();
+    };
+    match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(map)) => map,
+        _ => Map::new(),
+    }
+}
+
+/// 合并「库里的项」与「旧文件里的项」：旧文件优先（迁移未完成时的过渡形态）。
+///
+/// 只有 `kv` 与旧文件同时有内容才会用到（迁移跑一半、或用户在迁移前就改过
+/// 配置）。旧文件优先的理由：它是用户**完整**的那份配置，而库里的几项可能是
+/// 运行期刚写进去的零散值；反过来的话，用户会发现改过的项被旧文件的值盖回去。
+fn merge_legacy(store: Map<String, Value>) -> Map<String, Value> {
+    let legacy = read_legacy_file();
+    if legacy.is_empty() {
+        return store;
+    }
+    let mut merged = store;
+    for (key, value) in legacy {
+        merged.insert(key, value);
+    }
+    merged
+}
+
+/// 由磁盘内容 + 环境变量构造运行期配置（对应 Node 版 applyConfig 的优先级）
+fn build(raw: Map<String, Value>) -> RuntimeConfig {
+    let retention = retention_from(&raw);
+    let scheduled = scheduled_from(&raw);
+    let retry = retry_from(&raw);
+    let timeouts = timeouts_from(&raw);
+    let queue = queue_from(&raw);
+    let captcha_pool = captcha_pool_from(&raw);
+    let routing = routing_from(&raw);
+    RuntimeConfig {
+        // 文件里有就用文件的，否则环境变量兜底（对应 `if (config.apiKey && !opts.apiKey)`）。
+        // 这里存的是**磁盘原值**：`apiKey` 从本轮改造起可能是 `enc1:` 信封（顶层旧
+        // 字段的原地加密迁移见 `core::legacy_api_key`）。解开它只发生在
+        // `masked_api_key` —— 为什么不在快照构建期解密，见那个函数的说明。
+        api_key: string_field(&raw, "apiKey").or_else(env_api_key),
+        locale: env_text("WORKBUDDY_LOCALE")
+            .or_else(|| string_field(&raw, "locale"))
+            .unwrap_or_else(|| DEFAULT_LOCALE.to_string()),
+        default_model: env_text("WORKBUDDY_DEFAULT_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+        last_request_model: string_field(&raw, "lastRequestModel"),
+        retention,
+        scheduled,
+        retry,
+        timeouts,
+        queue,
+        captcha_pool,
+        routing,
+        log_dir: string_field(&raw, KEY_LOG_DIR),
+        request_stats_dir: string_field(&raw, KEY_REQUEST_STATS_DIR),
+        debug_dir: string_field(&raw, KEY_DEBUG_DIR),
+        // 只有字面 `true` 算开启（手改文件写 "1" / "yes" 一律当关）：与
+        // 「写坏回落」同一取向 —— 这个开关控制是否把凭据落盘，宁可少采
+        debug_mode: raw.get(KEY_DEBUG_MODE).and_then(Value::as_bool).unwrap_or(false),
+        // 只有字面 `false` 算关闭：**默认开**（缺失 → true）。这个开关是「要不要
+        // 剥离会被上游误拦的模板句」，默认关会让新用户一上来就撞 400 code=11128
+        // ——与 debug_mode 的「默认关」取向相反，因为两者的默认值代价不同。
+        sanitize_fingerprints: raw
+            .get(KEY_SANITIZE_FINGERPRINTS)
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        // 只有字面 `false` 算关闭：**默认开**（缺失 → true）。改写语义无损
+        // （developer 与 system 在 OpenAI 语义上等价），而默认关会让发 developer
+        // 角色的客户端（新版 OpenAI SDK、Claude Code 等）一上来就撞不认识该角色
+        // 的上游 —— 与 sanitize_fingerprints 同一取向：默认关的代价落在用户的
+        // 第一次真实请求上。
+        developer_role_compat: raw
+            .get(KEY_DEVELOPER_ROLE_COMPAT)
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        // Cline 伪装头覆盖表：只收 string → string 的项（手改库写出数字/布尔
+        // 值的项直接忽略 —— 头值只会是文本），缺失 = 全默认
+        cline_upstream_headers: cline_headers_from(&raw),
+        // 只有字面 `true` 算开启：**默认关**（缺失 → false）。开着 `*` 的网关面
+        // 等于把「转发上游、消耗额度」的能力交给任何网页，所以宁可让用户显式打开
+        // （见 KEY_CORS_ENABLED 的说明）；与 sanitize 的「默认开」取向相反，
+        // 因为两者的默认值代价不同。
+        cors_enabled: raw
+            .get(KEY_CORS_ENABLED)
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        // AI 助手配置：容忍度与 cline_upstream_headers 一致（逐项容错、
+        // 写坏不整块废掉），默认值口径见 assistant_config 模块头
+        assistant: assistant_config::from_raw(&raw),
+        // 只有字面 `true` 算开启：**默认关**。与 debug_mode 同一取向（两者的
+        // 代价都是「多做了一件界面没说清的事」），而与 sanitize_fingerprints
+        // 相反（那个默认关会让新用户一上来就撞 400）。这里默认关的理由见
+        // KEY_STRIP_NEWLINE_KEEPALIVE 的文档：它会吃掉「单独成片的真换行」。
+        // 配置项缺失时环境变量兜底（Docker 部署第一次启动就能开）。
+        strip_newline_keepalive: raw
+            .get(KEY_STRIP_NEWLINE_KEEPALIVE)
+            .and_then(Value::as_bool)
+            .unwrap_or_else(env_strip_newline_keepalive),
+        // 只有字面 `true` / `false` 算写了这一项：**默认关**。与上面那条同一取向
+        // （改的是客户端可观测的行为），而代价的方向不同：这里多打的是**上游往返**、
+        // 花的是账号额度，所以更要宁可没开。取值链（文件 > 环境变量
+        // `AGENT2API_AUTO_CONTINUE` > 关）在 `parse::auto_continue_from`，
+        // 与下面那条同一形态 —— 本模块的分工是「读写入口」，口径在 parse.rs。
+        auto_continue: auto_continue_from(&raw),
+        // 轮数上限：文件的合法值 > 环境变量 `AGENT2API_AUTO_CONTINUE_MAX` > 默认 3。
+        // **越界回落而不是夹紧**（与 `bounded_int_field` 全线一致）：写了 99 的人
+        // 该看到自己填的 99 没生效，而不是被悄悄按到 8 —— 后者会让人以为
+        // 「8 轮上限」是系统给的值。
+        auto_continue_max_rounds: auto_continue_rounds_from(&raw),
+        // 只有字面 `false` 算关闭：**默认开**。登录 / 注册的暴破与抢注防护
+        // 宁可多一道不可少一道（见 KEY_CAPTCHA_ENABLED 的说明）。配置项缺失
+        // 时环境变量兜底：登录页人机验证组件环境变量，默认为1开启，0为关闭
+        // （见 env_captcha_enabled）
+        captcha_enabled: raw
+            .get(KEY_CAPTCHA_ENABLED)
+            .and_then(Value::as_bool)
+            .unwrap_or_else(env_captcha_enabled),
+        // 只有字面 `false` 算关闭：**默认开**（理由见 KEY_MODELS_DEV_ENABLED）。
+        // 没有环境变量兜底：它不是「部署时才知道要不要开」的东西（Docker 与
+        // 桌面端都一样，内嵌快照保证功能在离线时也有内容）。
+        models_dev_enabled: raw
+            .get(KEY_MODELS_DEV_ENABLED)
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        // 系统提示词：模式非法/缺失 → passthrough（默认），文件读不到 → 内置默认
+        // + 一条原因（见 `prompt_from`）
+        prompt: prompt_from(&raw),
+        // 更新出网线路：null / 缺省都不进字段（None = 直连）
+        update_proxy: raw
+            .get(KEY_UPDATE_PROXY)
+            .filter(|value| !value.is_null())
+            .cloned(),
+        // 只有字面 `true` 算开启：**默认关**。beta 版由 beta 分支构建、可能不稳定，
+        // 默认开的代价落在「用户没要求却被换到 beta 通道」上（与 debug_mode 同一
+        // 取向：默认关只是让功能对没打开的人不存在）。理由见 KEY_UPDATE_BETA。
+        update_beta: raw
+            .get(KEY_UPDATE_BETA)
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        // 内核存放目录：空串 / 相对路径在**读**的时候才判（`kernel_dir()` 的
+        // resolve_dir 同一口径），这里只去掉空串
+        kernel_dir: string_field(&raw, KEY_KERNEL_DIR),
+        // 内核下载线路：与 update_proxy 同一处理（null / 缺省 = 默认链）
+        kernel_proxy: raw
+            .get(KEY_KERNEL_PROXY)
+            .filter(|value| !value.is_null())
+            .cloned(),
+        // GitHub 令牌信封：空串按未设置处理（手改库写出的空值不该被当成密文）
+        github_token: string_field(&raw, KEY_GITHUB_TOKEN)
+            .filter(|envelope| !envelope.is_empty()),
+        raw,
+    }
+}
+
+/// `clineUpstreamHeaders` 的解析：`{"<header>": "<value>"}`，只收字符串值。
+///
+/// 容错口径与 `gateway_text_from` 相同：值不是字符串的项**跳过不报错**
+/// （头值只会是文本，手改库写出的数字/布尔没有意义），整体不是对象 = 没配。
+fn cline_headers_from(raw: &Map<String, Value>) -> std::collections::BTreeMap<String, String> {
+    let mut table = std::collections::BTreeMap::new();
+    let Some(object) = raw.get(KEY_CLINE_UPSTREAM_HEADERS).and_then(Value::as_object) else {
+        return table;
+    };
+    for (key, value) in object {
+        if let Some(text) = value.as_str() {
+            table.insert(key.trim().to_string(), text.to_string());
+        }
+    }
+    table
+}
+
+/// 从原始配置解析系统提示词设置（**在这里就把文件读完**，见字段说明）。
+///
+/// 口径与既有配置一致：
+///   - 模式非法 / 缺失 → `passthrough`（默认）。手改文件写坏了**不报错**，
+///     与「写坏回落」的既有取向相同；走接口的非法值由 `api::prompt` 拦成 400；
+///   - `passthrough`：不读文件、不加载文本（`text` 为空串，转发层据此零开销透传）；
+///   - `custom` / `append`：文件非空就读它；读失败（不存在 / 非 UTF-8 / 空文件）
+///     回落**内置默认**并把原因记进 `file_error` —— 桌面应用不能因为一个提示词
+///     文件启动不了、也不能因此拒绝转发，而原因会显示在设置页上，用户当场能改；
+///   - 文件未指定 → 内置默认。
+fn prompt_from(raw: &Map<String, Value>) -> PromptSettings {
+    use crate::server::core::prompt::PromptMode;
+
+    let mode = raw
+        .get(KEY_PROMPT_MODE)
+        .and_then(Value::as_str)
+        .and_then(PromptMode::parse)
+        .unwrap_or_default();
+    let file = string_field(raw, KEY_PROMPT_FILE);
+    let inline = string_field(raw, KEY_PROMPT_TEXT);
+    let base = resolve_choice(mode, file, inline);
+    PromptSettings {
+        mode: base.mode,
+        file: base.file,
+        inline: base.inline,
+        text: base.text,
+        source: base.source,
+        file_error: base.file_error,
+        providers: providers_from(raw),
+        gateway: gateway_from(raw),
+        gateway_text: gateway_text_from(raw),
+    }
+}
+
+/// `promptGatewayText` 的解析：`{"<providerId>": {"identity"?, "stable"?, "dynamic"?}}`。
+///
+/// 与 `gateway_from` 同一取向的容错：项不是对象 → 跳过这一家；段值不是字符串 →
+/// 当作这段没配（用官方原文）。段名认不出（用户手写错）时**不报错也不猜** ——
+/// 它只是被忽略，官方原文照旧，排障时看得见差异在哪一段。
+fn gateway_text_from(
+    raw: &Map<String, Value>,
+) -> std::collections::BTreeMap<String, crate::server::core::prompt::GatewayBlocks> {
+    let mut table = std::collections::BTreeMap::new();
+    let Some(object) = raw.get(KEY_PROMPT_GATEWAY_TEXT).and_then(Value::as_object) else {
+        return table;
+    };
+    for (id, value) in object {
+        let id = id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        let Some(entry) = value.as_object() else { continue };
+        let mut blocks = crate::server::core::prompt::GatewayBlocks::default();
+        for field in crate::server::core::prompt::GatewayBlocks::FIELDS {
+            if let Some(text) = entry.get(field).and_then(Value::as_str) {
+                if !text.trim().is_empty() {
+                    blocks.set(field, text.to_string());
+                }
+            }
+        }
+        // 三段全空 = 用户把所有覆盖都清了：配置里不留空壳（与写侧同一口径）
+        if !blocks.is_empty() {
+            table.insert(id.to_string(), blocks);
+        }
+    }
+    table
+}
+
+/// `promptGateway` 的解析：`{"<providerId>": bool}`，只认**真正的布尔**。
+///
+/// 手改配置写成 `"false"` 这种字符串时**不猜**（`as_bool()` 只认 `true`/`false`）：
+/// 猜错的方向是「用户以为关掉了、网关照样装着发出去」，而按缺失处理只是回到默认 ——
+/// 相比之下，一个没生效的开关比一个静默生效的误读更容易被发现。
+fn gateway_from(raw: &Map<String, Value>) -> std::collections::BTreeMap<String, bool> {
+    let mut gateway = std::collections::BTreeMap::new();
+    let Some(object) = raw.get(KEY_PROMPT_GATEWAY).and_then(Value::as_object) else {
+        return gateway;
+    };
+    for (id, value) in object {
+        let id = id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        if let Some(flag) = value.as_bool() {
+            gateway.insert(id.to_string(), flag);
+        }
+    }
+    gateway
+}
+
+/// `promptProviders` 的解析：逐家按**同一口径**解析（见 [`resolve_choice`]）。
+///
+/// 手改配置时的容错取向与全局键一致（写坏回落、不报错、不影响启动）：
+///   · 项不是对象 → 跳过这一家（当作没配）；
+///   · `mode` 缺失/非法 → 按默认 `passthrough`（与全局键同一条 `.unwrap_or_default()`）；
+///   · `file` 非字符串 → 当作没配（用内置默认）；
+///   · id 不是字符串 → 跳过（注册表校验留给写侧接口，读侧不认识也照样存着 ——
+///     用户可能先写好配置、后加自定义提供商）。
+fn providers_from(raw: &Map<String, Value>) -> std::collections::BTreeMap<String, ProviderPrompt> {
+    use crate::server::core::prompt::PromptMode;
+
+    let mut providers = std::collections::BTreeMap::new();
+    let Some(object) = raw.get(KEY_PROMPT_PROVIDERS).and_then(Value::as_object) else {
+        return providers;
+    };
+    for (id, value) in object {
+        let id = id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        let Some(entry) = value.as_object() else { continue };
+        let mode = entry
+            .get(KEY_PROMPT_MODE)
+            .and_then(Value::as_str)
+            .and_then(PromptMode::parse)
+            .unwrap_or_default();
+        let file = entry
+            .get(KEY_PROMPT_FILE)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|text| !text.trim().is_empty());
+        let inline = entry
+            .get(KEY_PROMPT_TEXT)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|text| !text.trim().is_empty());
+        let choice = resolve_choice(mode, file, inline);
+        providers.insert(
+            id.to_string(),
+            ProviderPrompt {
+                mode: choice.mode,
+                file: choice.file,
+                inline: choice.inline,
+                text: choice.text,
+                source: choice.source,
+                file_error: choice.file_error,
+            },
+        );
+    }
+    providers
+}
+
+/// 「模式 + 文件路径 + 界面正文」→ 生效文本的**唯一解析口径**（全局默认与逐家覆盖共用）。
+///
+/// 四档优先级：界面正文 > 提示词文件 > 内置默认；`passthrough` 一律不读盘（也没人
+/// 会读那份文本 —— 透传就是不动 system）。
+///
+/// `passthrough` 下**仍然把界面正文带出来**（`text` = 用户存的那份，来源仍是 `none`）：
+/// 它是用户自己写下的东西，设置页的编辑框必须看得见 —— 否则「昨天保存的正文，今天
+/// 打开是空的」看起来就是丢了。文件不在此列：透传不读盘这条不变（省一次 I/O，
+/// 也避免界面暗示「它正在生效」）。
+fn resolve_choice(
+    mode: crate::server::core::prompt::PromptMode,
+    file: Option<String>,
+    inline: Option<String>,
+) -> ResolvedChoice {
+    use crate::server::core::prompt::{PromptMode, PromptSource, BUILT_IN_PROMPT};
+
+    if !matches!(mode, PromptMode::Custom | PromptMode::Append) {
+        let stored = inline.clone().filter(|text| !text.trim().is_empty());
+        return ResolvedChoice {
+            mode,
+            file,
+            text: stored.clone().unwrap_or_default(),
+            inline: stored,
+            source: PromptSource::None,
+            file_error: None,
+        };
+    }
+    // 用户在界面上编辑过：以他那份为准（**不去读文件**，于是文件读不到也不再是
+    // 一条告警 —— 那份文件此刻确实没在用，报一个不影响任何行为的错只会误导）
+    if let Some(text) = inline.clone().filter(|text| !text.trim().is_empty()) {
+        return ResolvedChoice {
+            mode,
+            file,
+            inline: Some(text.clone()),
+            text,
+            source: PromptSource::Inline,
+            file_error: None,
+        };
+    }
+    let built_in = || ResolvedChoice {
+        mode,
+        file: file.clone(),
+        inline: None,
+        text: BUILT_IN_PROMPT.to_string(),
+        source: PromptSource::BuiltIn,
+        file_error: None,
+    };
+    let Some(path) = file.as_deref().map(str::trim).filter(|text| !text.is_empty()) else {
+        return built_in();
+    };
+    match read_prompt_file(path) {
+        Ok(text) => ResolvedChoice {
+            mode,
+            file,
+            inline: None,
+            text,
+            source: PromptSource::File,
+            file_error: None,
+        },
+        Err(error) => ResolvedChoice { file_error: Some(error), ..built_in() },
+    }
+}
+
+/// [`resolve_choice`] 的结果（字段与 [`ProviderPrompt`] 同构，外加 mode）。
+struct ResolvedChoice {
+    mode: crate::server::core::prompt::PromptMode,
+    file: Option<String>,
+    inline: Option<String>,
+    text: String,
+    source: crate::server::core::prompt::PromptSource,
+    file_error: Option<String>,
+}
+
+/// 读提示词文件（UTF-8 文本）；`Err` 是**可直接显示给用户**的原因。
+///
+/// 空文件（或只有空白）算读失败：它在 `custom` 模式下等于「什么都不做」
+/// （空文本被 `prompt::rewrite` 当成「不动」），静默失效比显式回落更坏 ——
+/// 所以按「没配」处理，回落内置默认并说明原因。
+pub fn read_prompt_file(path: &str) -> Result<String, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("提示词文件路径为空".to_string());
+    }
+    match std::fs::read_to_string(trimmed) {
+        Ok(text) if text.trim().is_empty() => {
+            Err(format!("提示词文件是空的：{trimmed}（已回落内置默认提示词）"))
+        }
+        Ok(text) => Ok(text),
+        Err(error) => Err(format!("读不到提示词文件 {trimmed}: {error}")),
+    }
+}
+
+/// 进程内全局配置快照：所有模块共用，避免每个请求都读盘
+static CONFIG: RwLock<Option<RuntimeConfig>> = RwLock::new(None);
+
+/// 初始化全局配置（启动时调用一次；重复调用会重新读库，幂等）。
+///
+/// ── 签名为什么从 `init()` 改成接 `Db` ───────────────────────
+/// 配置的真相来源从 `config.json` 变成了统一库的 `kv` 表，路径这件事由 `Db`
+/// 唯一持有（`Db::file()`）。与 `LogStore::with_db` / `RequestStats::with_db`
+/// / `AccountStore::with_db` 同一形态，各 store 的构造
+/// 方式保持一致；`Option<Db>` 也一致（库打不开时仍能构造，只是降级）。
+///
+/// 装入时机是 `bootstrap` 里的第一件事（`Db::open` 之后、迁移之前）——
+/// 为什么必须早于迁移，见 `read_raw` 的论证（日志/统计/报文三项迁移依赖它）。
+/// 装入时只读一次并构造快照；**迁移跑完不必重新装入**：迁移是「把旧文件里的
+/// 东西搬进库」，而快照已经从旧文件读到了同样的值（`merge_legacy`），
+/// 重装只是白读一遍库。
+pub fn init(db: Option<Db>) -> RuntimeConfig {
+    let db = db.filter(|db| {
+        // 打不开的库句柄不该装进来（`Db` 只在打开成功时才有值，这里是防御）
+        let _ = db;
+        true
+    });
+    let _ = DB.set(db);
+    let snapshot = build(read_raw());
+    if let Ok(mut guard) = CONFIG.write() {
+        *guard = Some(snapshot.clone());
+    }
+    snapshot
+}
+
+/// 重读配置并替换内存快照（迁移跑完之后由调用点补一次）。
+///
+/// 为什么需要它：`init` 在迁移前后读到的值可能是**两种形态**（迁移前从旧文件
+/// 回落读、迁移后从库读）。两者在正常情况下等价（迁移就是把旧文件搬进库），
+/// 但迁移可能**部分失败**（某个键写不进、事务回滚），此时库里的配置与快照
+/// 会有差异。迁移结束时调用一次，让快照与库对齐 —— 否则本次运行会用一份
+/// 「迁移想写但没写成」的值跑，而用户下次启动看到的又是另一份。
+///
+/// 只在迁移真的产生过结果时才由调用点触发（`db::migrate` 的返回非空）；
+/// 没有任何旧文件时不必多读一次库。
+pub fn reload() -> RuntimeConfig {
+    let snapshot = build(read_raw());
+    if let Ok(mut guard) = CONFIG.write() {
+        *guard = Some(snapshot.clone());
+    }
+    snapshot
+}
+
+/// 进程级库句柄（与 `logging` / `core::debug_traffic` 同一模式）。
+///
+/// `OnceLock<Option<Db>>` 而不是 `OnceLock<Db>`：`Db::open` 可能失败，而
+/// `init` 的签名要接 `Option<Db>`（调用点手里就是它）—— 包在 `Option` 里让
+/// 「未初始化」与「初始化了但库不可用」共用同一条取值路径（都是 `None`）。
+static DB: std::sync::OnceLock<Option<Db>> = std::sync::OnceLock::new();
+
+/// 进程级库句柄（未初始化或库不可用时为 `None`）
+fn db() -> Option<Db> {
+    DB.get().and_then(|slot| slot.as_ref()).cloned()
+}
+
+/// 读取当前生效配置的克隆。
+///
+/// 未初始化时按「空磁盘 + 环境变量」临时构造一份，保证任何初始化顺序都不会 panic。
+/// 返回克隆而不是引用：避免调用方持有读锁跨越 await 与文件 IO。
+pub fn current() -> RuntimeConfig {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.clone();
+        }
+    }
+    build(Map::new())
+}
+
+/// 在配置读锁内跑一个**只读、短小**的闭包，只借出快照的 `raw` 表（**不克隆**）。
+///
+/// ── 为什么需要它（与上面各 `*_enabled` 轻量读取同一动机）──────
+/// `current()` 每次调用都会克隆整份 `raw`（含提示词全文那几百行）。有些读取
+/// 点只想要 `raw` 里的**一两个键**，却跑在热路径上：典型是账号列表构建时
+/// 按 provider 查一个自定义提供商记录里的方案字段（逐账号一次）。为它们付
+/// 整份克隆的代价没必要，而逐个键写一个 `*_of()` 访问器又会让本模块认识
+/// 别的模块的数据形状。
+///
+/// ── 闭包的约束（持有读锁，务必短小）────────────────────────
+/// 闭包执行期间配置的**读锁是持有的**：写侧 `update()` 会被它挡住。因此闭包里
+/// 只允许「取键、比较、拷出一两个值」这类纯内存动作 —— 不得做文件 / 网络 IO，
+/// 不得再获取任何其它锁（本进程有多个 RwLock，交叉持锁是死锁的经典配方）。
+///
+/// 未初始化时返回 `None`（与 `current()` 回落空配置不同：这里没有可借的表，
+/// 调用方按「查不到」处理）。
+pub fn with_raw<R>(reader: impl FnOnce(&Map<String, Value>) -> R) -> Option<R> {
+    let guard = CONFIG.read().ok()?;
+    let config = guard.as_ref()?;
+    Some(reader(config.raw()))
+}
+
+/// 只取网关面跨域访问开关的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 [`retention_settings`] 同一理由：这条判定在**每个 `/v1/*` 请求**上跑一次
+/// （CORS 中间件最外层逐请求判），而 `current()` 每次都会克隆整个 `raw` Map
+/// （含提示词全文那几百行）—— 为读一个布尔值付这个代价没必要。
+///
+/// 读的是内存快照而不是磁盘：`update()` 落盘后会同步刷新快照，所以
+/// 「设置页刚保存 → 下一个请求就用新行为」成立，且不必每次读文件。
+/// 未初始化（理论上只有启动极早期）时给默认值（关）。
+pub fn cors_enabled() -> bool {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.cors_enabled;
+        }
+    }
+    false
+}
+
+/// 只取 AI 助手配置（**不克隆整份 raw**）。
+///
+/// 与 [`cors_enabled`] 同一理由：助手对话入口与设置页各取一次，而 `current()`
+/// 每次都会克隆整个 `raw` Map（含提示词全文那几百行）。未初始化（理论上只有
+/// 启动极早期）时给 [`AssistantConfig::default`]。
+pub fn assistant_config() -> AssistantConfig {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.assistant.clone();
+        }
+    }
+    AssistantConfig::default()
+}
+
+/// 只取保留期设置的轻量读取（**不克隆整份 raw**）。
+///
+/// 为什么不让调用方用 `current().retention()`：保留期是在**每次写日志**
+/// 上调用的（`LogStore::append` → 裁剪），而 `current()` 每次都会克隆整个
+/// `raw` Map —— 热路径上没必要。这里只读锁取一个 `Copy` 值。
+///
+/// 读的是内存快照而不是磁盘：`update()` 落盘后会同步刷新快照，所以
+/// 「设置页刚保存 → 下一次裁剪就用新值」成立，且不必每次读文件。
+/// 未初始化（理论上只有启动极早期）时给默认值。
+pub fn retention_settings() -> RetentionSettings {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.retention;
+        }
+    }
+    RetentionSettings::default()
+}
+
+/// 只取**某一家**的网关自带提示词开关（**不克隆整份 raw**）。
+///
+/// 为什么不走 `current().prompt_plan()`：适配器在「构造一次上游请求」时问它，
+/// 而 `current()` 每次调用都克隆整个 `raw` Map（含提示词全文那几百行）——
+/// 为读一个布尔值付这个代价没必要。语义与 `PromptPlan::gateway_prompt` 一致：
+/// **不在表里 = true（装）**，这是本开关对存量行为的全部兼容性保证。
+///
+/// 未初始化（理论上只有启动极早期）时同样给 `true`。
+pub fn gateway_prompt_enabled(provider_id: &str) -> bool {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config
+                .prompt
+                .gateway
+                .get(provider_id.trim())
+                .copied()
+                .unwrap_or(true);
+        }
+    }
+    true
+}
+
+/// 只取**某一家**的网关自带提示词正文覆盖（**不克隆整份 raw**）。
+///
+/// 与 [`gateway_prompt_enabled`] 同一取舍：适配器在构造上游请求时问它，
+/// 而 `current()` 会克隆整个 `raw`。语义：**不在表里 = `None`（用官方原文）**，
+/// 有值时段内空白的那些段仍由调用方逐段回落到官方原文（见
+/// `core::prompt::GatewayBlocks::or`）—— 这里不做合并，只如实交出配置里存的那份。
+pub fn gateway_prompt_text(
+    provider_id: &str,
+) -> Option<crate::server::core::prompt::GatewayBlocks> {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.prompt.gateway_text.get(provider_id.trim()).cloned();
+        }
+    }
+    None
+}
+
+/// 只取「丢弃保活换行分片」开关的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 `retention_settings()` 同一取舍：它在**每次装配下发策略**时读
+/// （`upstream::provider_loop::frame_policy_of`，流式与非流式各一处），而
+/// `current()` 每调一次就克隆整个 `raw` Map —— 热路径上没必要。
+/// 未初始化（启动极早期 / 单元测试里没装配过配置）时退回环境变量，与 `current()`
+/// 在同样情形下 `build(空)` 的口径一致；两边都是**默认关**：没有明确开启
+/// 就不改写别人的字节。
+pub fn strip_newline_keepalive() -> bool {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.strip_newline_keepalive;
+        }
+    }
+    env_strip_newline_keepalive()
+}
+
+/// 只取「长度截断自动续写」开关的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 [`strip_newline_keepalive`] 同一取舍：转发层**每个请求**都要问一次
+/// 「这一轮要不要装成续写链」，而 `current()` 每调一次就克隆整个 `raw` Map
+/// （含提示词全文那几百行）—— 热路径上没必要。
+/// 未初始化（启动极早期 / 单元测试里没装配过配置）时退回环境变量，与 `current()`
+/// 在同样情形下 `build(空)` 的口径一致；两边都是**默认关**：没被明确开启就不替
+/// 用户多打一次上游。
+pub fn auto_continue() -> bool {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.auto_continue;
+        }
+    }
+    env_auto_continue()
+}
+
+/// 只取续写轮数上限的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 [`auto_continue`] 同一取舍（逐请求取一次，读锁取一个 `i64` 即可）。
+/// 未初始化时按「文件里没这项 + 环境变量」构造（与 `current()` 的 `build(空)`
+/// 同一条路径，都走 [`auto_continue_rounds_from`]），因此这里的兜底值与快照
+/// 装配出来的值必然一致 —— 不会出现「启动极早期按 3 轮跑、装配完按别的跑」。
+pub fn auto_continue_max_rounds() -> i64 {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.auto_continue_max_rounds;
+        }
+    }
+    auto_continue_rounds_from(&Map::new())
+}
+
+/// 只取 models.dev 元数据开关的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 `strip_newline_keepalive` 同一取舍：`core::model_meta::refresh` 每轮问一次，
+/// 而 `current()` 每调一次就克隆整个 `raw` Map。未初始化时给 `true` —— 与
+/// `build(空)` 的口径一致（这个开关**默认开**，见 `KEY_MODELS_DEV_ENABLED`）。
+pub fn models_dev_enabled() -> bool {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.models_dev_enabled;
+        }
+    }
+    true
+}
+
+/// 只取定时任务设置的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 `retention_settings()` 同一取舍：凭证维护与模型刷新的循环**每一轮**都要
+/// 问一次「现在开着吗、间隔多久」（这正是「改完设置下一轮生效」的实现方式），
+/// 而 `current()` 每次都会克隆整个 `raw` Map —— 循环里没必要。
+/// 读锁取一个 `Copy` 值即可。未初始化时给默认值。
+pub fn scheduled_settings() -> ScheduledSettings {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.scheduled;
+        }
+    }
+    ScheduledSettings::default()
+}
+
+/// 只取请求重试设置的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 `retention_settings()` 同一取舍：转发层每个失败请求都要问一次
+/// 「还能重试几次、间隔多久」，而 `current()` 每次都会克隆整个 `raw` Map
+/// —— 热路径上没必要。读锁取一份快照克隆（错误码名单是 `Arc`，
+/// 克隆只付一次指针自增）。未初始化时给默认值。
+pub fn retry_settings() -> RetrySettings {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.retry.clone();
+        }
+    }
+    RetrySettings::default()
+}
+
+/// 只取 Cline 伪装头覆盖表的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 [`gateway_prompt_enabled`] 同一取舍：Cline 适配器每次构造上游请求都要
+/// 问一次「用户改了哪些头」，而 `current()` 会克隆整个 `raw` Map。返回的是
+/// **覆盖表**（用户改过的键），默认值与合并语义在
+/// `core::providers::cline::headers`。未初始化时给空表（= 全默认）。
+pub fn cline_upstream_overrides() -> Vec<(String, String)> {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config
+                .cline_upstream_headers
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+/// 用一个变换函数原子地更新配置（读 → 改 → 落库 → 回写内存）。
+///
+/// `mutate` 只改内存快照；落库由本函数统一负责，避免两处都写库。
+///
+/// 「原子」有两层：内存快照的替换是一次写锁（`CONFIG.write()`），而库那一侧
+/// 由 `sql::write_all` 的一个事务保证（多行 UPSERT + 删除要么全成、要么全不成）。
+fn update<F>(mutate: F) -> bool
+where
+    F: FnOnce(&mut RuntimeConfig),
+{
+    let mut next = current();
+    mutate(&mut next);
+    let saved = save_raw(&next.raw);
+    if let Ok(mut guard) = CONFIG.write() {
+        *guard = Some(next);
+    }
+    saved
+}
+
+/// 把整份配置写进统一库（对应 Node 版 `saveConfig`）。
+///
+/// ── 与文件形态的语义差异（必须看清）─────────────────────────
+/// 改造前这是「整文件覆盖」：`raw` 里没有的键自然就不在文件里了，于是
+/// 「删掉一个配置项」（`set_api_key(None)` 会 `raw.remove`）能生效。
+/// 进库后行是**逐键**存在的，如果只做 UPSERT，被删掉的键会留在库里 ——
+/// 用户下次启动会看到刚清掉的那项又回来了。所以
+/// `sql::write_all` 在同一个事务里做「逐键 UPSERT + 删掉不在 `raw` 里的配置键」，
+/// 删除范围**排除** `db::schema::RESERVED_KV_KEYS`（那些是别的模块的状态）。
+///
+/// ── 为什么成功与否都要让内存快照生效 ────────────────────────
+/// 本函数只负责落库；内存快照由调用方（`update`）在之后统一刷新。写失败
+/// （库不可用、事务回滚）返回 `false`，但**本次运行内的改动仍然生效** ——
+/// 与改造前「写文件失败只打日志、不中断请求」一致：失败影响的只是
+/// 「重启后还在不在」，不该让正在跑的请求或被改的配置报错。
+///
+/// ── 日志为什么在 {@link sql::write_all} 之外打 ──────────────
+/// `Db::with` 持的是**全局唯一那把连接锁**，而 `logging::log` 的入库那一路
+/// 要往同一个库写 `logs` 表 —— `std::sync::Mutex` 不可重入，在闭包里打日志
+/// 等于当场死锁。所以 `write_all` 只把 `Result` 交出来，这里在锁外记
+/// （与日志库的处置相同）。
+///
+/// 注意本函数**在日志库初始化之前就可能被调用**（`bootstrap` 里
+/// `config::init` 早于 `logging::init_store`）：那时 `logging::log` 的入库
+/// 那一路会静默丢弃，只剩控制台 —— 这也正是它该用的通道（`console_line`
+/// 与 `log` 的控制台部分是同一个输出）。
+pub fn save_raw(raw: &Map<String, Value>) -> bool {
+    let Some(db) = db() else {
+        crate::server::logging::log(
+            "[Config]",
+            "❌ 保存失败: 数据库不可用（本次改动仅内存生效）",
+        );
+        return false;
+    };
+    match sql::write_all(&db, raw) {
+        Ok(()) => true,
+        Err(error) => {
+            crate::server::logging::log("[Config]", &format!("❌ 保存失败: {error}"));
+            false
+        }
+    }
+}
+
+/// 设置 API Key：`None` 表示删除（对应 Node 版 `body.apiKey === null` 分支）。
+/// 返回是否写盘成功；无论成功与否内存快照都已更新（本次运行立即生效）。
+///
+/// ── 写入侧落的是 `enc1:` 信封，不是明文 ───────────────────────
+/// 界面（管理页 POST /api/config）填的当然是明文，但落进 `raw`（= 磁盘那一行）的
+/// 值先经 `crypto::seal(…, SecretScope::Accounts)` —— 密钥域与 `apiKeys` 数组里的
+/// `key`、旧字段的原地加密迁移**共用同一个**（理由见 `api_keys` 模块头，不新增域）。
+/// 不在这里加密的后果是一段本可以不存在的明文窗口：面板上刚设的 Key 会以明文躺在
+/// 库里，直到下次启动的原地加密迁移（`core::legacy_api_key`）才被收敛 —— 而迁移的
+/// 前提是「那次启动跑得起来」，这期间任何一次「单独拷走库文件」都带走网关口令。
+///
+/// 内存快照 `config.api_key` 存**磁盘原值**（即上面的信封），与 `update_raw_field`
+/// （原地加密迁移走它）及 `build` 逐字同一条口径：该字段的唯一读者是
+/// `RuntimeConfig::masked_api_key`，解密也在那里。在这一层或调用方先解一遍，同一个
+/// 字段就会出现两种解释（明文 / 密文），掩码、比对、迁移三处迟早各按各的读法走。
+///
+/// ── 加密失败：fail closed，绝不静默落明文 ─────────────────────
+/// 加密失败只发生在保护最该生效的异常环境（密钥文件或配置目录建不出来、系统随机源
+/// 不可用），此时静默写明文等于「越该保护越失效」，而界面上完全看不出区别。
+/// 所以失败即 `Err` 上抛、**一个字节都不写**（`raw` 与内存快照都保持原样，旧 Key
+/// 照常可用），调用方（`api::config_api::post_config`）把错误报给用户 ——
+/// 与 `api_keys::save` 同一取向（那里的完整论证见 `ApiKeyEntry::to_value`）。
+/// 与它相对的是「落库失败」：那只影响「重启后还在不在」，沿用配置层的既有语义
+/// （`Ok(false)`，内存已更新，不升级成一次请求错误，见 `save_raw` 的说明）。
+pub fn set_api_key(api_key: Option<String>) -> Result<bool, String> {
+    let Some(key) = api_key else {
+        // 删除分支与原先逐字相同：删掉键而不是写空值（多处注释引用的既有语义，
+        // 见 `set_update_proxy` / `set_prompt` 的「与 set_api_key(None) 同一语义」）。
+        // 这条路不经过加密，因此 `Err` 不可能出现
+        return Ok(update(|config| {
+            config.raw.remove(crate::server::core::api_keys::KEY_API_KEY);
+            config.api_key = None;
+        }));
+    };
+    // 加密必须在 `update` **之前**做：`update` 的闭包只能改内存、没法中止保存，
+    // 把加密塞进闭包的话，加密失败时手里就只剩「写明文」或「写空值」两条路 ——
+    // 两条都是静默的形态错误。放在外面则失败时一个字节都不写（下面这一行不会执行）
+    let envelope = crate::server::core::crypto::seal(
+        key.as_bytes(),
+        crate::server::core::crypto::SecretScope::Accounts,
+    )?;
+    Ok(update(move |config| {
+        config.raw.insert(
+            crate::server::core::api_keys::KEY_API_KEY.to_string(),
+            Value::String(envelope.clone()),
+        );
+        // 快照存磁盘原值（信封）而不是明文：解密在唯一读者 `masked_api_key`，
+        // 见函数头的说明
+        config.api_key = Some(envelope);
+    }))
+}
+
+/// 整份替换 `apiKeys` 列表，并删掉旧的单 Key 字段 `apiKey`（从此只有一份真相；
+/// 环境变量注入的 Key 不在文件里，`active_api_keys` 仍会把它算进去）。
+pub fn replace_api_keys(list: Value) -> bool {
+    update(move |config| {
+        config
+            .raw
+            .insert(crate::server::core::api_keys::KEY_API_KEYS.to_string(), list.clone());
+        config.raw.remove(crate::server::core::api_keys::KEY_API_KEY);
+        config.api_key = None;
+    })
+}
+
+/// 更新语言（只接受非空字符串，对应 Node 版 `typeof body.locale === 'string' && body.locale`）
+pub fn set_locale(locale: &str) -> bool {
+    let locale = locale.to_string();
+    update(|config| {
+        config.raw.insert("locale".to_string(), Value::String(locale.clone()));
+        config.locale = locale.clone();
+    })
+}
+
+/// 记住本次请求用的模型（对应 Node 版 rememberRequestModel：仅在变化时写盘）
+pub fn remember_request_model(model: &str) {
+    let trimmed = model.trim();
+    if trimmed.is_empty() || current().last_request_model.as_deref() == Some(trimmed) {
+        return;
+    }
+    let value = trimmed.to_string();
+    update(|config| {
+        config
+            .raw
+            .insert("lastRequestModel".to_string(), Value::String(value.clone()));
+        config.last_request_model = Some(value.clone());
+    });
+}
+
+/// 写入 config.json 里任意字段（其他字段原样保留）。低频路径专用。
+pub fn update_raw_field(key: &str, value: Value) -> bool {
+    let key = key.to_string();
+    update(move |config| {
+        config.raw.insert(key.clone(), value.clone());
+        // apiKey 属于「生效字段」，写它时要同步内存里的值。这里存的是**磁盘原值**
+        // （本函数也会被用来往这个键里写 `enc1:` 信封，见 `core::legacy_api_key`
+        // 的原地加密迁移），给界面看的解密在 `RuntimeConfig::masked_api_key` 里
+        // —— 为什么不在这一层解密，那里有说明。
+        if key == crate::server::core::api_keys::KEY_API_KEY {
+            config.api_key = string_field(&config.raw, crate::server::core::api_keys::KEY_API_KEY);
+        }
+    })
+}
+
+/// 更新三档保留天数（`None` = 该项不动），返回是否写盘成功。
+///
+/// 调用方（`stats_api::put_retention`）**必须先校验范围**：本函数按「已合法」
+/// 处理，越界值会被 `days_field` 的回读逻辑丢弃（那会让用户以为设置生效了）。
+///
+/// 内存快照与 raw 底稿一起改（与 `set_api_key` 同一模式）：前者让下一次裁剪
+/// 立刻用新值，后者保证写盘时不会把字段吃掉。无论写盘成功与否内存都已更新
+/// （与其它 setter 一致），所以「设置页保存 → 立即清理」不依赖磁盘 IO。
+pub fn set_retention(patch: RetentionPatch) -> bool {
+    update(|config| {
+        let mut next = config.retention;
+        // 只写传进来的项：缺省项保持原值，也**不落盘**成默认值 ——
+        // 否则「只改日志天数」会把另外两项一并固化成默认值，抹掉用户设置
+        let mut apply = |key: &str, value: Option<i64>, slot: &mut i64| {
+            if let Some(days) = value {
+                config.raw.insert(key.to_string(), Value::from(days));
+                *slot = days;
+            }
+        };
+        apply(KEY_LOG_RETENTION_DAYS, patch.log_days, &mut next.log_days);
+        apply(
+            KEY_REQUEST_RETENTION_DAYS,
+            patch.request_days,
+            &mut next.request_days,
+        );
+        apply(KEY_DAILY_RETENTION_DAYS, patch.daily_days, &mut next.daily_days);
+        config.retention = next;
+    })
+}
+
+/// 更新一条间隔型任务（`None` = 该项不动），返回是否写盘成功。
+///
+/// `key` 必须是本模块的 `KEY_CREDENTIAL_MAINTENANCE` 等四个常量之一 ——
+/// 它们是 `scheduledTasks` 下的子键，**不在这里做白名单校验**：调用方
+/// （`scheduled_tasks::configure`）已经按任务 id 查过注册表，认不出的 id
+/// 在那一层就被拒了。
+///
+/// 调用方**必须先校验间隔范围**（与 `set_retention` 同一约定）：本函数按
+/// 「已合法」处理，越界值会被 `interval_field` 的回读逻辑丢弃。
+///
+/// 与 `set_retention` 同一模式：内存快照与 raw 底稿一起改 —— 前者让正在跑的
+/// 循环下一轮就用新间隔（不必重启进程），后者保证写盘时不吃掉兄弟字段
+/// （只改一条任务时，`scheduledTasks` 下其余各条必须原样保留）。
+pub fn set_scheduled_task(
+    key: &str,
+    patch: IntervalTaskPatch,
+    min: i64,
+    max: i64,
+) -> bool {
+    let key = key.to_string();
+    update(move |config| {
+        // 先在 raw 里把这条任务的子对象取出来（不存在就建一个），再逐项写入。
+        // 用 `entry` 形态而不是「重建整个 scheduledTasks」：后者会抹掉其它三条
+        // 任务的设置，以及将来可能加进去的兄弟字段。
+        let root = config
+            .raw
+            .entry(KEY_SCHEDULED_TASKS.to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !root.is_object() {
+            // 文件里被手改成了非对象（如字符串）：整块替换成对象。
+            // 不静默忽略 —— 那会让保存「成功」但值没落盘，比覆盖更糟。
+            *root = Value::Object(Map::new());
+        }
+        let Some(tasks) = root.as_object_mut() else {
+            return;
+        };
+        let entry = tasks
+            .entry(key.clone())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !entry.is_object() {
+            *entry = Value::Object(Map::new());
+        }
+        let Some(task) = entry.as_object_mut() else {
+            return;
+        };
+        if let Some(enabled) = patch.enabled {
+            task.insert("enabled".to_string(), Value::Bool(enabled));
+        }
+        if let Some(interval) = patch.interval {
+            // 写入前按范围收口：调用方已校验过，这里再夹一次只是防御
+            //（手改文件与接口两条路径都不该把越界值落到盘上）
+            task.insert(
+                "interval".to_string(),
+                Value::from(interval.clamp(min, max)),
+            );
+        }
+        // 关键一步：重解析内存快照。**不能**只改 raw ——
+        // 循环读的是 `scheduled_settings()` 里的解析结果，不同步刷新的后果是
+        // 「界面上改完、循环还是按旧间隔跑」（且要等下次重启才生效），
+        // 与保留期那套「改完立刻生效」的承诺不一致。
+        config.scheduled = scheduled_from(&config.raw);
+    })
+}
+
+/// 更新请求重试设置（`None` = 该项不动），返回是否写盘成功。
+///
+/// 调用方（`retry_api::put_retry`）**必须先校验范围**：本函数按「已合法」
+/// 处理，越界值会被 `bounded_int_field` 的回读逻辑丢弃（那会让用户以为
+/// 设置生效了）。
+///
+/// 与 `set_retention` 同一模式：内存快照与 raw 底稿一起改 —— 前者让下一个
+/// 失败请求立刻用新值，后者保证写盘时不吃掉 config.json 里的其它字段。
+pub fn set_retry(patch: RetryPatch) -> bool {
+    update(|config| {
+        let mut next = config.retry.clone();
+        if let Some(count) = patch.count {
+            config.raw.insert(KEY_RETRY_COUNT.to_string(), Value::from(count));
+            next.count = count;
+        }
+        if let Some(count) = patch.account_switch_count {
+            config
+                .raw
+                .insert(KEY_RETRY_ACCOUNT_SWITCH_COUNT.to_string(), Value::from(count));
+            next.account_switch_count = count;
+        }
+        if let Some(seconds) = patch.interval_seconds {
+            config
+                .raw
+                .insert(KEY_RETRY_INTERVAL_SECONDS.to_string(), Value::from(seconds));
+            next.interval_seconds = seconds;
+        }
+        if let Some(codes) = &patch.no_retry_codes {
+            // raw 底稿存「与 API 契约同形」的整数数组（写侧已校验排序去重，
+            // 这里原样落库）；内存快照换成新的共享切片
+            let array: Vec<Value> = codes.iter().map(|code| Value::from(*code)).collect();
+            config
+                .raw
+                .insert(KEY_RETRY_NO_RETRY_CODES.to_string(), Value::Array(array));
+            next.no_retry_codes = std::sync::Arc::from(codes.as_slice());
+        }
+        config.retry = next;
+    })
+}
+
+// ─── 上游请求超时（connectTimeoutSeconds / headersTimeoutSeconds /
+//     streamIdleTimeoutSeconds / bodyTimeoutSeconds）──────────────────
+
+/// 只取四项超时的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 `retry_settings()` 同一取舍：转发层每次发送、每个分片都要取一次，
+/// 读锁取一份 `Copy` 快照即可。未初始化时给默认值。
+pub fn timeout_settings() -> TimeoutSettings {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.timeouts;
+        }
+    }
+    TimeoutSettings::default()
+}
+
+/// 更新四项超时（`None` = 该项不动），返回是否写盘成功。
+///
+/// 调用方（`timeouts_api::put_timeouts`）**必须先校验范围**：本函数按
+/// 「已合法」处理，越界值会被 `bounded_int_field` 的回读逻辑丢弃。
+/// 与 `set_retry` 同一模式：内存快照与 raw 底稿一起改。
+pub fn set_timeouts(patch: TimeoutPatch) -> bool {
+    update(|config| {
+        let mut next = config.timeouts;
+        let mut write = |key: &str, value: i64, slot: &mut i64| {
+            config.raw.insert(key.to_string(), Value::from(value));
+            *slot = value;
+        };
+        if let Some(seconds) = patch.connect_seconds {
+            write(KEY_TIMEOUT_CONNECT_SECONDS, seconds, &mut next.connect_seconds);
+        }
+        if let Some(seconds) = patch.headers_seconds {
+            write(KEY_TIMEOUT_HEADERS_SECONDS, seconds, &mut next.headers_seconds);
+        }
+        if let Some(seconds) = patch.stream_idle_seconds {
+            write(
+                KEY_TIMEOUT_STREAM_IDLE_SECONDS,
+                seconds,
+                &mut next.stream_idle_seconds,
+            );
+        }
+        if let Some(seconds) = patch.body_seconds {
+            write(KEY_TIMEOUT_BODY_SECONDS, seconds, &mut next.body_seconds);
+        }
+        config.timeouts = next;
+    })
+}
+
+// ─── 排队等待（queueMaxWaits / queueWaitSeconds）──────────────
+
+/// 只取排队等待的两项（**不克隆整份 raw**）。
+///
+/// 与 `timeout_settings()` 同一取舍：走排队制的适配器每次遇到排队都要取一次，
+/// 读锁取一份 `Copy` 快照即可。未初始化时给默认值。
+pub fn queue_settings() -> QueueSettings {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.queue;
+        }
+    }
+    QueueSettings::default()
+}
+
+/// 更新排队等待（`None` = 该项不动），返回是否写盘成功。
+///
+/// 调用方（`queue_api::put_queue`）**必须先校验范围**：本函数按「已合法」处理，
+/// 越界值会被 `bounded_int_field` 的回读逻辑丢弃。与 `set_timeouts` 同一模式：
+/// 内存快照与 raw 底稿一起改。
+pub fn set_queue(patch: QueuePatch) -> bool {
+    update(|config| {
+        let mut next = config.queue;
+        if let Some(count) = patch.max_waits {
+            config
+                .raw
+                .insert(KEY_QUEUE_MAX_WAITS.to_string(), Value::from(count));
+            next.max_waits = count;
+        }
+        if let Some(seconds) = patch.wait_seconds {
+            config
+                .raw
+                .insert(KEY_QUEUE_WAIT_SECONDS.to_string(), Value::from(seconds));
+            next.wait_seconds = seconds;
+        }
+        config.queue = next;
+    })
+}
+
+// ─── ZCode 验证码令牌池（zcodeCaptchaPoolTarget / PollMs / MaxPerRound）──
+
+/// 只取令牌池的三项（**不克隆整份 raw**）。
+///
+/// 与 `queue_settings()` 同一取舍：stats 端点每次被铸造器轮询都要取一次，
+/// 读锁取一份 `Copy` 快照即可。未初始化时给默认值。
+pub fn captcha_pool_settings() -> CaptchaPoolSettings {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.captcha_pool;
+        }
+    }
+    CaptchaPoolSettings::default()
+}
+
+/// 更新令牌池节奏（`None` = 该项不动），返回是否写盘成功。
+///
+/// 调用方（`zcode_captcha_pool_api::put_captcha_pool`）**必须先校验范围**：
+/// 本函数按「已合法」处理，越界值会被 `bounded_int_field` 的回读逻辑丢弃。
+/// 与 `set_queue` 同一模式：内存快照与 raw 底稿一起改。
+pub fn set_captcha_pool(patch: CaptchaPoolPatch) -> bool {
+    update(|config| {
+        let mut next = config.captcha_pool;
+        if let Some(target) = patch.target {
+            config
+                .raw
+                .insert(KEY_CAPTCHA_POOL_TARGET.to_string(), Value::from(target));
+            next.target = target;
+        }
+        if let Some(poll_ms) = patch.poll_ms {
+            config
+                .raw
+                .insert(KEY_CAPTCHA_POOL_POLL_MS.to_string(), Value::from(poll_ms));
+            next.poll_ms = poll_ms;
+        }
+        if let Some(max_per_round) = patch.max_per_round {
+            config.raw.insert(
+                KEY_CAPTCHA_POOL_MAX_PER_ROUND.to_string(),
+                Value::from(max_per_round),
+            );
+            next.max_per_round = max_per_round;
+        }
+        config.captcha_pool = next;
+    })
+}
+
+// ─── 账号路由（routingStrategy / routingSticky / 退避 / 垫底 / 熔断）──
+
+/// 只取路由设置的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 `timeout_settings()` 同一取舍：转发层每次选路都要取一次，读锁取一份
+/// `Copy` 快照即可。未初始化时给默认值。
+pub fn routing_settings() -> RoutingSettings {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.routing;
+        }
+    }
+    RoutingSettings::default()
+}
+
+/// 更新路由设置（`None` = 该项不动），返回是否写盘成功。
+///
+/// 调用方（`routing_api::put_routing`）**必须先校验范围**：本函数按「已合法」
+/// 处理，越界值会被 `bounded_int_field` 的回读逻辑丢弃。与 `set_timeouts`
+/// 同一模式：内存快照与 raw 底稿一起改。
+pub fn set_routing(patch: RoutingPatch) -> bool {
+    update(|config| {
+        let mut next = config.routing;
+        if let Some(strategy) = patch.strategy {
+            config
+                .raw
+                .insert(KEY_ROUTING_STRATEGY.to_string(), Value::from(strategy.as_str()));
+            next.strategy = strategy;
+        }
+        if let Some(sticky) = patch.sticky {
+            config
+                .raw
+                .insert(KEY_ROUTING_STICKY.to_string(), Value::from(sticky.as_str()));
+            next.sticky = sticky;
+        }
+        let mut write_bool = |key: &str, value: bool, slot: &mut bool| {
+            config.raw.insert(key.to_string(), Value::Bool(value));
+            *slot = value;
+        };
+        if let Some(enabled) = patch.failover_backoff {
+            write_bool(KEY_ROUTING_FAILOVER_BACKOFF, enabled, &mut next.failover_backoff);
+        }
+        if let Some(enabled) = patch.sink {
+            write_bool(KEY_ROUTING_SINK, enabled, &mut next.sink);
+        }
+        if let Some(enabled) = patch.breaker_enabled {
+            write_bool(KEY_ROUTING_BREAKER_ENABLED, enabled, &mut next.breaker_enabled);
+        }
+        if let Some(count) = patch.breaker_threshold {
+            config
+                .raw
+                .insert(KEY_ROUTING_BREAKER_THRESHOLD.to_string(), Value::from(count));
+            next.breaker_threshold = count;
+        }
+        if let Some(seconds) = patch.breaker_timeout_seconds {
+            config
+                .raw
+                .insert(KEY_ROUTING_BREAKER_TIMEOUT.to_string(), Value::from(seconds));
+            next.breaker_timeout_seconds = seconds;
+        }
+        if let Some(count) = patch.breaker_success_threshold {
+            config
+                .raw
+                .insert(KEY_ROUTING_BREAKER_SUCCESS.to_string(), Value::from(count));
+            next.breaker_success_threshold = count;
+        }
+        config.routing = next;
+    })
+}
+
+// ─── 调试模式（debugMode）────────────────────────────────────
+
+/// 写入调试模式开关。
+///
+/// 与 `set_retry` 同一模式：内存快照与 raw 底稿一起改 —— 前者让下一个请求
+/// 立刻用新值（转发层逐请求读快照），后者保证写盘时不吃掉 config.json 里的
+/// 其它字段。返回是否落盘成功（失败时内存仍已更新，见调用点）。
+pub fn set_debug_mode(enabled: bool) -> bool {
+    update(|config| {
+        config
+            .raw
+            .insert(KEY_DEBUG_MODE.to_string(), Value::Bool(enabled));
+        config.debug_mode = enabled;
+    })
+}
+
+// ─── 出站指纹脱敏（sanitizeBlacklistFingerprints）─────────────
+
+/// 写入出站指纹脱敏开关。
+///
+/// 与 `set_debug_mode` 同一模式：内存快照与 raw 底稿一起改 —— 前者让下一个请求
+/// 立刻用新值（转发层逐请求读快照），后者保证写盘时不吃掉 config.json 里的
+/// 其它字段。返回是否落盘成功（失败时内存仍已更新，见调用点）。
+pub fn set_sanitize_fingerprints(enabled: bool) -> bool {
+    update(|config| {
+        config
+            .raw
+            .insert(KEY_SANITIZE_FINGERPRINTS.to_string(), Value::Bool(enabled));
+        config.sanitize_fingerprints = enabled;
+    })
+}
+
+// ─── 开发者角色兼容（developerRoleCompat）────────────────────
+
+/// 写入开发者角色兼容开关。
+///
+/// 与 `set_debug_mode` 同一模式：内存快照与 raw 底稿一起改 —— 前者让下一个请求
+/// 立刻用新值（转发层逐请求读快照），后者保证写盘时不吃掉 config.json 里的
+/// 其它字段。返回是否落盘成功（失败时内存仍已更新，见调用点）。
+pub fn set_developer_role_compat(enabled: bool) -> bool {
+    update(|config| {
+        config
+            .raw
+            .insert(KEY_DEVELOPER_ROLE_COMPAT.to_string(), Value::Bool(enabled));
+        config.developer_role_compat = enabled;
+    })
+}
+
+// ─── Cline 伪装头覆盖表（clineUpstreamHeaders）────────────────
+
+/// 写入 Cline 伪装头的**整份覆盖表**（PUT 语义 = 整体替换）。
+///
+/// 与 `set_debug_mode` 同一模式：内存快照与 raw 底稿一起改 —— 前者让下一个
+/// 请求立刻用新值（适配器逐请求读快照），后者保证写盘时不吃掉配置里的
+/// 其它字段。空表 = 清掉所有覆盖（全部回落默认值）。调用方（`api::cline_headers`）
+/// 负责入参校验（键非空、值是字符串、数量与长度有界）。
+pub fn set_cline_upstream_headers(overrides: std::collections::BTreeMap<String, String>) -> bool {
+    let value = Value::Object(
+        overrides
+            .iter()
+            .map(|(key, text)| (key.clone(), Value::String(text.clone())))
+            .collect(),
+    );
+    update(|config| {
+        config
+            .raw
+            .insert(KEY_CLINE_UPSTREAM_HEADERS.to_string(), value.clone());
+        config.cline_upstream_headers = overrides;
+    })
+}
+
+// ─── 网关面跨域访问（corsEnabled）───────────────────────────
+
+/// 写入网关面跨域访问开关（设置页「安全 → 网关跨域访问」）。
+///
+/// 与 `set_sanitize_fingerprints` 同一模式：内存立即生效（CORS 中间件逐请求读
+/// 快照，改完下一个请求就用新行为，不重启进程），写盘时不吃掉 config.json 里的
+/// 其它字段。
+pub fn set_cors_enabled(enabled: bool) -> bool {
+    update(|config| {
+        config
+            .raw
+            .insert(KEY_CORS_ENABLED.to_string(), Value::Bool(enabled));
+        config.cors_enabled = enabled;
+    })
+}
+
+/// 写入 AI 助手配置（整块替换）。
+///
+/// 与其它 setter 同一模式：内存快照立即生效（下一个对话请求就用新值），raw 底稿
+/// 一起改保证写盘不吃掉其它键。返回 `false` 只表示**落库失败**（本次运行内仍生效）。
+pub fn set_assistant_config(config: AssistantConfig) -> bool {
+    let value = config.to_value();
+    update(|current| {
+        current
+            .raw
+            .insert(KEY_ASSISTANT_CONFIG.to_string(), value);
+        current.assistant = config;
+    })
+}
+
+// ─── 保活换行丢弃（stripNewlineKeepalive）───────────────────
+
+/// 写入「丢弃保活换行分片」开关。
+///
+/// 与 `set_sanitize_fingerprints` 同一模式：内存快照立即生效（下一个请求的
+/// 策略装配就用新值），raw 底稿一起改保证写盘不吃掉其它键。开与关都记一条
+/// 事件日志（见调用点）—— 开的那一刻起，下发帧不再是上游原样的字节，
+/// 这件事必须在日志里查得到。
+pub fn set_strip_newline_keepalive(enabled: bool) -> bool {
+    update(|config| {
+        config
+            .raw
+            .insert(KEY_STRIP_NEWLINE_KEEPALIVE.to_string(), Value::Bool(enabled));
+        config.strip_newline_keepalive = enabled;
+    })
+}
+
+// ─── 长度截断的自动续写（autoContinue / autoContinueMaxRounds）────
+
+/// 自动续写两项的**唯一**落盘路径：`None` = 该项不动。
+///
+/// 与 `set_retention` / `set_routing` 同一模式：内存快照与 raw 底稿一起改 ——
+/// 前者让下一个请求立刻用新值（转发层逐请求读快照），后者保证写盘时不吃掉
+/// 配置里的其它字段。
+///
+/// ── 为什么两个公开 setter 都要经过这里 ──────────────────────
+/// 一次 PUT 若拆成两次 `update()`，就是两次「读底稿 → 整份落盘」，中间那次
+/// 失败会留下「开关已开、上限还是旧值」的半套状态，而这两项要一起读才有意义；
+/// 单项写也只让「一次请求写几项」这件事散落在调用方。本函数一次写完，
+/// `set_auto_continue` / `set_auto_continue_max_rounds` 是它的两个单项投影。
+///
+/// 调用方（`api::auto_continue` 与两个公开 setter 的使用者）**必须先校验范围**：
+/// 本函数按「已合法」处理，越界值会被 `auto_continue_rounds_from` 的回读逻辑
+/// 丢弃（那会让用户以为设置生效了）。
+pub fn set_auto_continue_patch(patch: AutoContinuePatch) -> bool {
+    update(|config| {
+        if let Some(enabled) = patch.enabled {
+            config
+                .raw
+                .insert(KEY_AUTO_CONTINUE.to_string(), Value::Bool(enabled));
+            config.auto_continue = enabled;
+        }
+        if let Some(rounds) = patch.max_rounds {
+            config
+                .raw
+                .insert(KEY_AUTO_CONTINUE_MAX_ROUNDS.to_string(), Value::from(rounds));
+            config.auto_continue_max_rounds = rounds;
+        }
+    })
+}
+
+/// 写入「长度截断自动续写」开关。
+///
+/// 与 `set_strip_newline_keepalive` 同一模式（内存立即生效 + raw 底稿一起改），
+/// 开与关都记一条事件日志（见调用点）：开的那一刻起，一次客户端请求可能对应
+/// 多次上游往返、多花一份额度，这件事必须在日志里查得到。
+pub fn set_auto_continue(enabled: bool) -> bool {
+    set_auto_continue_patch(AutoContinuePatch {
+        enabled: Some(enabled),
+        max_rounds: None,
+    })
+}
+
+/// 写入续写的轮数上限（`1..=8`，调用方须已校验）。
+///
+/// 与 [`set_auto_continue_patch`] 同一模式；单独留这个入口是给转发侧与脚本
+/// 场景（只想调预算、不想碰开关），语义与 PUT 里带上
+/// `autoContinueMaxRounds` 一项完全相同 —— 走的是同一条落盘路径。
+pub fn set_auto_continue_max_rounds(rounds: i64) -> bool {
+    set_auto_continue_patch(AutoContinuePatch {
+        enabled: None,
+        max_rounds: Some(rounds),
+    })
+}
+
+/// 写入机器人校验开关（设置页「通用 → 机器人校验」）。
+///
+/// 与 `set_sanitize_fingerprints` 同一模式：内存立即生效（登录 / 注册端点
+/// 逐请求读快照），写盘时不吃掉 config.json 里的其它字段。
+pub fn set_captcha_enabled(enabled: bool) -> bool {
+    update(|config| {
+        config
+            .raw
+            .insert(KEY_CAPTCHA_ENABLED.to_string(), Value::Bool(enabled));
+        config.captcha_enabled = enabled;
+    })
+}
+
+/// 写入 models.dev 模型元数据开关（设置页「通用 → models.dev 模型元数据」）。
+///
+/// 与 `set_captcha_enabled` 同一模式：内存立即生效（下次刷新发起时读它），
+/// 写盘时不吃掉 config.json 里的其它字段。**不清理已装载的索引**：关闭的含义是
+/// 「别再联网拉了」，不是「把已经拿到的元数据扔掉」（见 `KEY_MODELS_DEV_ENABLED`）。
+pub fn set_models_dev_enabled(enabled: bool) -> bool {
+    update(|config| {
+        config
+            .raw
+            .insert(KEY_MODELS_DEV_ENABLED.to_string(), Value::Bool(enabled));
+        config.models_dev_enabled = enabled;
+    })
+}
+
+// ─── 更新出网线路（updateProxy）─────────────────────────────
+
+/// 只取「软件更新」出网线路的轻量读取（**不克隆整份 raw**）。
+///
+/// 检查与下载各只在**发起时**读一次（低频），但同样不必为它克隆整份
+/// `raw` Map —— 读锁取那一个字段即可。未初始化时给 None（直连）。
+pub fn update_proxy() -> Option<Value> {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.update_proxy.clone();
+        }
+    }
+    None
+}
+
+/// 写入「软件更新」的出网线路（None = 直连）。
+///
+/// 值由调用方先归一（`api::update` 走 `normalize_account_proxy`），这里不做
+/// 二次校验 —— 解析失败（出口后来被删 / 被禁）由读取方兜底（回退默认出口，
+/// 见 `core::update::client`），与账号转发「代理不可用回退直连」同一取向。
+/// 与 `set_sanitize_fingerprints` 同一模式：内存立即生效（下一次检查 / 下载
+/// 就用新线路，含定时任务，不必重启进程），写盘时不吃掉其它字段。
+pub fn set_update_proxy(proxy: Option<Value>) -> bool {
+    update(move |config| {
+        match proxy.clone() {
+            Some(value) => {
+                config.raw.insert(KEY_UPDATE_PROXY.to_string(), value);
+                config.update_proxy = proxy.clone();
+            }
+            None => {
+                // 直连**删掉键**而不是写 null：与 set_api_key(None) 同一语义，
+                // 配置里不留没意义的空值（读侧也按缺省 = 直连处理）
+                config.raw.remove(KEY_UPDATE_PROXY);
+                config.update_proxy = None;
+            }
+        }
+    })
+}
+
+// ─── 「加入 beta 版」开关（updateBeta）──────────────────────────
+
+/// 只取「加入 beta 版」开关的轻量读取（**不克隆整份 raw**）。
+///
+/// 每次更新检查发起时读一次（低频），未初始化时给 false（正式通道）——
+/// 与缺省一致，理由见 `KEY_UPDATE_BETA`。
+pub fn update_beta() -> bool {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.update_beta;
+        }
+    }
+    false
+}
+
+/// 写入「加入 beta 版」开关（设置页「更新设置」弹窗里的那一枚）。
+///
+/// 与 `set_sanitize_fingerprints` 同一模式：内存立即生效（下一次检查就换通道，
+/// 含定时任务，不必重启进程），写盘时不吃掉其它字段。
+///
+/// **不动已经缓存的检查结果与排期**：换通道之后要不要立刻重查由调用方决定
+/// （界面拨完开关会主动查一次，见 update-settings.tsx），后端只负责回答
+/// 「下一次检查按哪个通道看」；排期与失败冷却都与通道无关（那条冷却记的是
+/// GitHub 配额桶的恢复时刻，见 core::update::check 的说明）。
+pub fn set_update_beta(enabled: bool) -> bool {
+    update(|config| {
+        config
+            .raw
+            .insert(KEY_UPDATE_BETA.to_string(), Value::Bool(enabled));
+        config.update_beta = enabled;
+    })
+}
+
+// ─── 代理内核：存放目录与下载线路（kernelDir / kernelProxy）──────
+
+/// 内核存放目录的**原始配置值**（未设置 / 空串给 None）。
+///
+/// 解析（要求绝对路径、否则回落默认目录）在 `core::sub_kernel::kernel_dir`：
+/// 那里才是「内核目录到底在哪」的唯一答案，本函数只把用户填的东西原样交出去
+/// —— 两处各解析一遍就会有两套口径。
+pub fn kernel_dir_raw() -> Option<String> {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.kernel_dir.clone();
+        }
+    }
+    None
+}
+
+/// 写入内核存放目录（None = 恢复默认目录，连键一起删）。
+///
+/// 值由调用方先判（`api::subscriptions` 要求绝对路径）—— 与
+/// `set_update_proxy` 同一取向：写侧拦「明显写错」，读侧再兜一次底
+/// （手改库写进相对路径时回落默认目录，而不是让内核装到某个相对路径上）。
+pub fn set_kernel_dir(dir: Option<String>) -> bool {
+    update(move |config| {
+        let cleaned = dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string);
+        match cleaned {
+            Some(value) => {
+                config.raw.insert(KEY_KERNEL_DIR.to_string(), Value::String(value.clone()));
+                config.kernel_dir = Some(value);
+            }
+            None => {
+                config.raw.remove(KEY_KERNEL_DIR);
+                config.kernel_dir = None;
+            }
+        }
+    })
+}
+
+/// 只取内核下载线路的轻量读取（**不克隆整份 raw**，与 `update_proxy` 同形）。
+/// 未初始化时给 None（默认链）。
+pub fn kernel_proxy() -> Option<Value> {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.kernel_proxy.clone();
+        }
+    }
+    None
+}
+
+/// 写入内核下载线路（None = 默认链：直连失败借 Clash 混合端口重试一次）。
+///
+/// 值由调用方先归一（`api::subscriptions` 走 `normalize_account_proxy`）。
+/// 解析失败（选中的出口后来被删 / 被禁）**由下载侧直接报错**，不像更新那样
+/// 悄悄回落 —— 用户在这个弹窗里专门选了一条线路，静默改走直连会让
+/// 「下载失败：无法连接 GitHub」这条信息把人引向错误的方向。
+pub fn set_kernel_proxy(proxy: Option<Value>) -> bool {
+    update(move |config| {
+        match proxy.clone() {
+            Some(value) => {
+                config.raw.insert(KEY_KERNEL_PROXY.to_string(), value);
+                config.kernel_proxy = proxy.clone();
+            }
+            None => {
+                config.raw.remove(KEY_KERNEL_PROXY);
+                config.kernel_proxy = None;
+            }
+        }
+    })
+}
+
+// ─── GitHub 令牌信封（githubToken）────────────────────────
+
+/// 只取 GitHub 令牌密文信封的轻量读取（**不克隆整份 raw**）。
+///
+/// 加解密都在 `core::update::token`（这里只存取信封，理由见字段说明）。
+/// 未初始化时给 None（未在界面保存）。
+pub fn github_token_envelope() -> Option<String> {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.github_token.clone();
+        }
+    }
+    None
+}
+
+/// 写入 GitHub 令牌的密文信封（None = 清除，连键一起删）。
+///
+/// **只收信封不收明文**：调用方（`core::update::token::set_token`）负责加密
+/// 与校验。与 `set_update_proxy` 同一模式：内存立即生效（下一次检查更新就用
+/// 新令牌），写盘时不吃掉其它字段。
+pub fn set_github_token_envelope(envelope: Option<String>) -> bool {
+    update(move |config| {
+        match envelope.clone() {
+            Some(value) => {
+                config.raw.insert(KEY_GITHUB_TOKEN.to_string(), Value::String(value));
+                config.github_token = envelope.clone();
+            }
+            None => {
+                config.raw.remove(KEY_GITHUB_TOKEN);
+                config.github_token = None;
+            }
+        }
+    })
+}
+
+// ─── 系统提示词（promptMode / promptFile / promptText）──────────
+
+/// 写入系统提示词设置（模式 + 文件 + 界面正文），并**按新值重新解析一遍生效文本**。
+///
+/// 与 `set_sanitize_fingerprints` 同一模式，但多一步：写完键之后重跑一次
+/// [`prompt_from`]。只改字段不重解析会出现「模式换了、`text` 还是上一份」的
+/// 静默错配（`custom` 模式却拿着空文本 = 什么都不做），而重解析顺带把
+/// 「文件此刻读不到」的原因一起刷新 —— 用户改完路径立刻能在界面上看到结果。
+///
+/// `file` / `inline` 为空串/None 时**删掉对应的键**（而不是写空串）：与
+/// `set_api_key(None)` 同一语义，配置里不留下没意义的空值。两者互不影响 ——
+/// 清掉界面正文之后，提示词文件（若配了）立刻接管。
+///
+/// 返回是否落盘成功（失败时内存仍已更新，见调用点）。
+pub fn set_prompt(
+    mode: crate::server::core::prompt::PromptMode,
+    file: Option<String>,
+    inline: Option<String>,
+) -> bool {
+    update(|config| {
+        config
+            .raw
+            .insert(KEY_PROMPT_MODE.to_string(), Value::String(mode.as_str().to_string()));
+        match file.filter(|text| !text.trim().is_empty()) {
+            Some(path) => {
+                config
+                    .raw
+                    .insert(KEY_PROMPT_FILE.to_string(), Value::String(path));
+            }
+            None => {
+                config.raw.remove(KEY_PROMPT_FILE);
+            }
+        }
+        match inline.filter(|text| !text.trim().is_empty()) {
+            Some(text) => {
+                config
+                    .raw
+                    .insert(KEY_PROMPT_TEXT.to_string(), Value::String(text));
+            }
+            None => {
+                config.raw.remove(KEY_PROMPT_TEXT);
+            }
+        }
+        config.prompt = prompt_from(&config.raw);
+    })
+}
+
+/// 写入/删除**某一家**的提示词覆盖，并重跑一次解析（与 [`set_prompt`] 同一理由：
+/// 只改字段不重解析会出现「模式换了、`text` 还是上一份」的静默错配）。
+///
+/// `patch` 为 `None` = **删掉这一家**（回落全局默认，配置里不留空壳对象）；
+/// 为 `Some(ProviderPromptPatch)` = 写入这一家（`file` / `inline` 为空串/None =
+/// 用内置默认提示词；`gateway` 见那个类型的字段说明）。
+///
+/// 返回是否落盘成功（失败时内存仍已更新，见调用点）。
+pub fn set_prompt_provider(provider_id: &str, patch: Option<ProviderPromptPatch>) -> bool {
+    let id = provider_id.trim().to_string();
+    if id.is_empty() {
+        return false;
+    }
+    update(|config| {
+        // 先把这一家的旧值抹掉，再按 patch 决定写不写 —— 两条分支合成一处，
+        // 不会出现「删了键但 map 里还留着」这类不一致
+        let mut entry = config
+            .raw
+            .get(KEY_PROMPT_PROVIDERS)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        entry.remove(&id);
+        if let Some(patch) = patch {
+            let mut one = Map::new();
+            one.insert(
+                KEY_PROMPT_MODE.to_string(),
+                Value::String(patch.mode.as_str().to_string()),
+            );
+            if let Some(path) = patch.file.filter(|text| !text.trim().is_empty()) {
+                one.insert(KEY_PROMPT_FILE.to_string(), Value::String(path));
+            }
+            if let Some(text) = patch.inline.filter(|text| !text.trim().is_empty()) {
+                one.insert(KEY_PROMPT_TEXT.to_string(), Value::String(text));
+            }
+            entry.insert(id.clone(), Value::Object(one));
+        }
+        // 一家都不剩时把整个键删掉：配置里不留下没意义的空对象
+        // （与 `set_prompt` 对空文件路径的处理同一取向）
+        if entry.is_empty() {
+            config.raw.remove(KEY_PROMPT_PROVIDERS);
+        } else {
+            config
+                .raw
+                .insert(KEY_PROMPT_PROVIDERS.to_string(), Value::Object(entry));
+        }
+        config.prompt = prompt_from(&config.raw);
+    })
+}
+
+/// WorkBuddy 拆家迁移（2026-10）的**一次性标记**（config 顶层键）。
+///
+/// ── 为什么这几条迁移需要一个标记（与 `migrate_cline_split` 的差别）────
+/// Cline 那次是**改名**：旧键改完就不存在了，天然只命中一次。WorkBuddy 拆家
+/// 涉及的三条都是**复制**（模型规则、网关 Key 白名单、按家提示词覆盖）：
+/// 「一边有、另一边没有就补一份」这种判据在拆家之后**一直成立** —— 用户之后
+/// 在国内版新做的一次启停、新建的一把限了 workbuddy 的 Key、新配的一段提示词，
+/// 都会在下次启动被镜像到国际版，反复覆盖用户的明确意图。
+///
+/// 因此三条迁移共用一个标记、由 `account_bootstrap` 统一编排（见那里的调用点）：
+/// 处理过一次就不再回头，与 `raccoonImported` / `autoclawImported` 那几个
+/// 一次性导入标记同一模式。
+///
+/// 它是**配置键**而不是 `db::schema::RESERVED_KV_KEYS` 里的保留键：那一张表
+/// 是「不归配置管的零散状态」，本键由配置 API 读写。
+const WORKBUDDY_SPLIT_FLAG: &str = "workbuddySplitMigrated";
+
+/// 本机是否已经处理过 WorkBuddy 拆家的存量迁移
+pub fn workbuddy_split_migrated() -> bool {
+    current()
+        .raw()
+        .get(WORKBUDDY_SPLIT_FLAG)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// 写下「拆家迁移已处理」的标记。
+///
+/// **无论有没有可迁移的内容都要写**（全新安装也一样）：没有可继承的东西不代表
+/// 没处理过 —— 不写的话，用户之后配置国内版时那三条复制型迁移会突然把那些
+/// 配置镜像过去（正是本标记要防的事）。
+///
+/// 唯一**不**写的场合是规则迁移没落盘（见 `account_bootstrap` 的调用点）：
+/// 那时下次启动重来一次比停在半迁移状态安全。
+pub fn mark_workbuddy_split_migrated() -> bool {
+    update_raw_field(WORKBUDDY_SPLIT_FLAG, Value::Bool(true))
+}
+
+/// WorkBuddy 拆家（2026-10）的提示词覆盖同步：把 `promptProviders.workbuddy`
+/// **原样复制**一份给 `workbuddy-intl`。
+///
+/// ── 为什么必须做（不做的后果是静默失效）──────────────────────
+/// 拆家前 `workbuddy` 这一个 id 覆盖两个站点，因此「给 WorkBuddy 单独配一段
+/// 提示词 / 切成替换或追加模式」的用户设置本来对两地都生效。拆家后国际版是
+/// 另一个 id：不复制的话，那些设置对国际版**静默回落到全局默认**
+/// （多半是 passthrough），而这条设置最常见的用途恰恰是绕开 system 指纹拦截
+/// —— 症状是「国内版不撞 11-128、国际版又撞了」，用户完全想不到要去设置页
+/// 给另一家再配一遍。
+///
+/// ── 为什么是复制而不是搬（与 `migrate_cline_split` 的差别）──────
+/// 旧 id `workbuddy` 仍然存在（它就是国内版），搬走会把国内版的配置清空。
+///
+/// ── 实现口径 ────────────────────────────────────────────────
+/// 值**逐字复制**（不解析再重建）：这一项的形状由 `api::prompt` 的写侧校验，
+/// 这里只搬字节，任何重建都可能丢掉将来新增的键。没有 `workbuddy` 条目时
+/// 不写（不凭空造一个空壳）。
+///
+/// **只跑一次**：调用点（`account_bootstrap`）把它与另外两条拆家迁移放在同一个
+/// 一次性标记之下 —— 复制类迁移不能每次启动都跑，那会把用户拆家之后给国内版
+/// 新配的提示词反复镜像给国际版（完整理由见 [`WORKBUDDY_SPLIT_FLAG`]）。
+pub fn migrate_workbuddy_split_prompt_providers() -> Option<String> {
+    let intl = crate::server::core::providers::workbuddy::Region::Intl.provider_id();
+    let mut summary: Option<String> = None;
+    update(|config| {
+        let table = config
+            .raw
+            .get(KEY_PROMPT_PROVIDERS)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        if table.contains_key(intl) {
+            return;
+        }
+        let Some(inherited) = table.get("workbuddy").cloned() else {
+            return;
+        };
+        let mut next = table;
+        next.insert(intl.to_string(), inherited);
+        config
+            .raw
+            .insert(KEY_PROMPT_PROVIDERS.to_string(), Value::Object(next));
+        config.prompt = prompt_from(&config.raw);
+        summary = Some(format!(
+            "💬 已把 WorkBuddy 的提示词覆盖同步给国际版（拆家前它对两地都生效，设置口径保持不变）：{intl}"
+        ));
+    });
+    summary
+}
+
+/// 写**某一家**的网关自带提示词**正文覆盖**（`None` = 删键、回到官方原文）。
+///
+/// 与 [`set_prompt_gateway`]（装不装）分开两张表：改文本与拨开关互不牵连 ——
+/// 用户在编辑框里删掉自己那段、想回到官方原文时，不该顺手把开关也拨回去。
+/// 空段**不写进配置**（读侧按「这段没配」用官方原文），于是「只改了身份句」
+/// 在配置里就是一条只带 `identity` 的项，一眼看得出改的是哪一段。
+/// 返回是否落盘成功（失败时内存仍已更新，见调用点）。
+pub fn set_prompt_gateway_text(
+    provider_id: &str,
+    blocks: Option<crate::server::core::prompt::GatewayBlocks>,
+) -> bool {
+    let id = provider_id.trim().to_string();
+    if id.is_empty() {
+        return false;
+    }
+    update(|config| {
+        let mut table = config
+            .raw
+            .get(KEY_PROMPT_GATEWAY_TEXT)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        table.remove(&id);
+        if let Some(blocks) = blocks.filter(|blocks| !blocks.is_empty()) {
+            let mut one = Map::new();
+            for field in crate::server::core::prompt::GatewayBlocks::FIELDS {
+                let text = blocks.get(field);
+                if !text.trim().is_empty() {
+                    one.insert(field.to_string(), Value::String(text.to_string()));
+                }
+            }
+            table.insert(id.clone(), Value::Object(one));
+        }
+        if table.is_empty() {
+            config.raw.remove(KEY_PROMPT_GATEWAY_TEXT);
+        } else {
+            config
+                .raw
+                .insert(KEY_PROMPT_GATEWAY_TEXT.to_string(), Value::Object(table));
+        }
+        config.prompt = prompt_from(&config.raw);
+    })
+}
+
+/// 写**某一家**的网关自带提示词开关（`None` = 删键、回到默认「装」）。
+///
+/// 与 [`set_prompt_provider`] 分开的理由见 `KEY_PROMPT_GATEWAY` 的说明：
+/// 拨一下开关不该顺带把这家的模式 / 文件钉成显式值。返回是否落盘成功
+/// （失败时内存仍已更新，见调用点）。
+pub fn set_prompt_gateway(provider_id: &str, flag: Option<bool>) -> bool {
+    let id = provider_id.trim().to_string();
+    if id.is_empty() {
+        return false;
+    }
+    update(|config| {
+        let mut table = config
+            .raw
+            .get(KEY_PROMPT_GATEWAY)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        match flag {
+            Some(value) => {
+                table.insert(id.clone(), Value::Bool(value));
+            }
+            None => {
+                table.remove(&id);
+            }
+        }
+        if table.is_empty() {
+            config.raw.remove(KEY_PROMPT_GATEWAY);
+        } else {
+            config
+                .raw
+                .insert(KEY_PROMPT_GATEWAY.to_string(), Value::Object(table));
+        }
+        // 解析复用同一入口：`gateway` 与 `providers` 一起刷新，不会出现
+        // 「一个键更新了、另一个还是上一次解析结果」的静默错配
+        config.prompt = prompt_from(&config.raw);
+    })
+}
+
+// ─── 数据保存目录（logDir / requestStatsDir / debugDir）────────//
+// ── 为什么这里**只剩读**，没有对应的写函数（T8 收尾的一处）──────
+// 三个键在数据全部进统一库之后**失去了消费方**：日志、请求统计、调试报文都
+// 落在 `{config_dir}/agent2api.db` 里，不再有「各自的保存目录」。曾经的那个
+// 写入口 `set_storage_dir(key, dir)` 是给设置页三个「更改…」按钮用的，
+// 而它现在**一个调用方都没有**（那三个按钮已随单页改成只读而删除），
+// 于是整体删掉 —— 留一个没人调用的写函数，下次有人读到它只会以为
+// 「保存位置还能改」，然后发现改完什么都不会发生。
+//
+// 那为什么 `storage_dirs()` 与三个键常量**必须保留**：它们还有真实消费者，
+// 而且是**迁移项** —— `db::migrate` 的 `logs` / `requests` / `debug` 三项要
+// 用 `storage_dirs()` 去**用户当年自定义过的目录**里找旧文件（见那三项的
+// `legacy_file`）。用户升级前的 `logDir: "D:\\logs"` 正是那批历史数据的所在，
+// 少了这条读取，那三个目录里的旧数据就永远找不到（迁移会以为「没有旧文件」，
+// 而用户会在界面上看到「已升级」却发现日志全空了）。
+//
+// 一句话总结这个不对称：**读是历史数据的入口，写是已经不存在的功能**。
+// 将来若真的支持「更换数据库位置」，那应该是「新建库 + 导入 + 切配置目录」，
+// 而不是把某一个键改个值 —— 所以那时也不该把这个写函数拿回来。
+
+/// 按当前快照解析出的三类数据保存目录（**只服务迁移项找旧文件**）。
+#[derive(Clone, Debug)]
+pub struct StorageDirs {
+    /// 事件日志旧文件（`logs.jsonl`）的目录
+    pub log_dir: PathBuf,
+    /// 请求日志旧文件（`requests.jsonl` + `request-daily.jsonl`）的目录
+    pub request_stats_dir: PathBuf,
+    /// 调试模式原始报文旧文件（`debug-traffic.jsonl`）的目录
+    pub debug_dir: PathBuf,
+}
+
+/// 解析三类数据的保存目录：配置里写了**绝对路径**就用它，否则回落配置目录。
+///
+/// 「写坏回落而不是报错」的取舍：目录是启动期就要用的值（迁移项找旧文件的
+/// 候选目录），这里报错只会让迁移整批跳过 —— 而相对路径 / 空串最多是
+/// 「手改文件写得不规范」，回落到默认目录是任何情况下都安全的行为。
+pub fn storage_dirs() -> StorageDirs {
+    let base = config_dir();
+    // 只从内存快照读（`init` 之后才有意义；未初始化时回落默认 —— 与
+    // `retention_settings()` 同一兜底取向）。三次读锁合成一次，减少锁往返。
+    let (log_dir, request_stats_dir, debug_dir) = match CONFIG.read() {
+        Ok(guard) => match guard.as_ref() {
+            Some(config) => (
+                resolve_dir(config.log_dir.as_deref(), &base),
+                resolve_dir(config.request_stats_dir.as_deref(), &base),
+                resolve_dir(config.debug_dir.as_deref(), &base),
+            ),
+            None => (base.clone(), base.clone(), base.clone()),
+        },
+        // 锁中毒：配置快照读不出来，回落默认目录（与各读取函数同一取向）
+        Err(_) => (base.clone(), base.clone(), base.clone()),
+    };
+    StorageDirs {
+        log_dir,
+        request_stats_dir,
+        debug_dir,
+    }
+}
+
+/// 单个目录的解析：非空 + 绝对路径才算数，其余回落 `base`
+fn resolve_dir(raw: Option<&str>, base: &Path) -> PathBuf {
+    raw.map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| base.to_path_buf())
+}
+
+#[cfg(test)]
+mod auto_continue_tests {
+    //! 自动续写两项在**本模块**这一层的形状：装配快照的默认值、raw 底稿的
+    //! 不受污染、以及 `set_*` 必须同时写到底稿与解析字段。
+    //!
+    //! ── 为什么钉这三件事 ────────────────────────────────────
+    //!   - **默认值**：网关第一次启动、库里什么都没有时，转发层拿到的必须是
+    //!     「关 + 3 轮」。默认值写反不是「少一个功能」，而是替用户开始多打上游、
+    //!     多花额度；
+    //!   - **不许把默认种进 raw**：`raw` 是写盘底稿，默认值一旦写进去，
+    //!     「用户从未配过」与「用户选了默认」再也分不开 —— 环境变量那一级
+    //!     （语义是「配置里没有这一项时才看它」）随之永久失效；
+    //!   - **两处一起写**：只改 `raw` 会让转发层继续读旧的解析字段（界面上改完、
+    //!     行为不变，要等下次重启才对得上），只改解析字段则这一项根本落不了盘。
+    //!     两种都是「看起来成功」的失败，只能靠读回来才看得见。
+    //!
+    //! ── 为什么用例不操纵进程环境 ────────────────────────────
+    //! `std::env::set_var` 在同一进程里全局可见、并行用例互踩（同类取舍见
+    //! `core::providers::trae::forward::forward_at` 的注释）。所以这里每条断言
+    //! 都写成**与环境变量取值无关**的形式：要么给底稿显式的值（那一级本来就盖过
+    //! 环境变量），要么用「与同一条兜底表达式同值」这种差分形式。
+    //! 「文件值盖过环境变量」那一半在 `parse.rs` 的 `resolve_auto_continue` /
+    //! `resolve_rounds` 用例里钉死。
+
+    use super::*;
+    use serde_json::json;
+
+    /// 全局快照是进程级状态，而 `update()` 是「读整份 → 改 → 写整份」的**非原子**
+    /// 读改写：两条用例并行时，一条的写可能被另一条「读走的旧底稿」整体盖掉。
+    /// 本模块动全局的用例因此串行跑（与 `api::panel` 那把探针槽位锁同一手法）。
+    static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn hold_config() -> std::sync::MutexGuard<'static, ()> {
+        CONFIG_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 一份只含给定几项的原始底稿。
+    fn raw_of(pairs: &[(&str, Value)]) -> Map<String, Value> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), value.clone()))
+            .collect()
+    }
+
+    /// 空底稿（全新安装）＝「文件里没这两项」，落点必须是环境变量那一级；
+    /// 环境变量也没设时就是出厂的「关 + 3」，且**一个默认值都不许种进底稿**。
+    ///
+    /// 钉住的写歪：`unwrap_or(true)`（默认开）、上限回落成 0（开着开关却一轮都不续，
+    /// 而面板上看着是「已开启」），以及装配时顺手把默认值写进 `raw`。
+    #[test]
+    fn an_empty_backup_means_off_and_three_rounds_without_seeding_defaults() {
+        let fresh = build(Map::new());
+        // 差分形式：空底稿 ≡ 「文件没给」，那一级只能由环境变量说话
+        assert_eq!(fresh.auto_continue(), env_auto_continue(), "空底稿的开关落点必须只由环境变量决定");
+        assert_eq!(
+            fresh.auto_continue_max_rounds(),
+            auto_continue_rounds_from(&Map::new()),
+            "空底稿的上限落点必须只由环境变量与默认值决定"
+        );
+        if std::env::var_os("AGENT2API_AUTO_CONTINUE").is_none() {
+            assert!(!fresh.auto_continue(), "文件与环境变量都没配 → 必须是关");
+        }
+        if std::env::var_os("AGENT2API_AUTO_CONTINUE_MAX").is_none() {
+            assert_eq!(
+                fresh.auto_continue_max_rounds(),
+                DEFAULT_AUTO_CONTINUE_MAX_ROUNDS,
+                "文件与环境变量都没配 → 必须是默认 3 轮"
+            );
+        }
+        assert!(fresh.raw().is_empty(), "默认值只进解析字段，不许写进写盘底稿");
+    }
+
+    /// 底稿给了值就以它为准 —— 包括「写 `false` 关掉」与「写 1 / 8 这两个边界」。
+    ///
+    /// 钉住的写歪有三条，都是这条链上真会写出来的形状：
+    ///   - `raw.get(key).is_some()` 当开启（或 `!= false` 当开启）：面板上的
+    ///     「关掉」按钮就此失效，库里已经是 false 而行为照旧；
+    ///   - 越界夹紧：写 99 的人看到设置页显示 8，只会以为 8 是系统硬值，
+    ///     而「99 从未生效」这件事再也问不出来；
+    ///   - 类型写坏当成 0 / false：那让「手改了个字符串」与「显式选了下限」分不开。
+    #[test]
+    fn a_value_in_the_backup_is_the_value_that_gets_used() {
+        let on = build(raw_of(&[(KEY_AUTO_CONTINUE, json!(true))]));
+        assert!(on.auto_continue(), "文件写了 true 就必须是开");
+        assert_eq!(
+            on.auto_continue_max_rounds(),
+            auto_continue_rounds_from(&Map::new()),
+            "只写开关没写上限 → 上限走自己那一级，不受开关影响"
+        );
+
+        let off = build(raw_of(&[(KEY_AUTO_CONTINUE, json!(false))]));
+        assert!(!off.auto_continue(), "文件写了 false 就必须是关（关掉要能被表达）");
+
+        for bound in [AUTO_CONTINUE_MIN_ROUNDS, AUTO_CONTINUE_MAX_ROUNDS] {
+            let at_edge = build(raw_of(&[(KEY_AUTO_CONTINUE_MAX_ROUNDS, json!(bound))]));
+            assert_eq!(at_edge.auto_continue_max_rounds(), bound, "边界值 {bound} 必须是可用值");
+        }
+
+        let too_many = build(raw_of(&[(KEY_AUTO_CONTINUE_MAX_ROUNDS, json!(99))]));
+        assert_ne!(too_many.auto_continue_max_rounds(), 99, "越界的值不许原样生效");
+        assert_ne!(
+            too_many.auto_continue_max_rounds(),
+            AUTO_CONTINUE_MAX_ROUNDS,
+            "越界不许夹紧成上限，只能让位给下一级"
+        );
+        assert_eq!(
+            too_many.auto_continue_max_rounds(),
+            build(Map::new()).auto_continue_max_rounds(),
+            "越界的落点必须与「文件没这项」逐字相同"
+        );
+
+        // 类型写坏 = 没配（与读侧全线同一口径），不是「按下限」
+        let junk = build(raw_of(&[
+            (KEY_AUTO_CONTINUE, json!("true")),
+            (KEY_AUTO_CONTINUE_MAX_ROUNDS, json!("8")),
+        ]));
+        assert_eq!(junk.auto_continue(), build(Map::new()).auto_continue());
+        assert_eq!(junk.auto_continue_max_rounds(), build(Map::new()).auto_continue_max_rounds());
+    }
+
+    /// `set_auto_continue` / `set_auto_continue_max_rounds` 必须同时落到底稿与
+    /// 解析字段，且**不牵连兄弟项**。
+    ///
+    /// 钉住的写歪：
+    ///   - 只写 `raw`：下一个请求仍读旧的解析字段（`set_scheduled_task` 里那句
+    ///     「**不能**只改 raw —— 循环读的是 `scheduled_settings()` 里的解析结果」
+    ///     讲的就是同一个坑，只是那条落在定时循环上、这条落在转发热路径上）；
+    ///   - 写一项时把另一项按默认值补齐：用户「只想把预算收到 1 轮」，顺手把刚
+    ///     打开的开关关掉了；
+    ///   - 底稿里写成字符串（`Value::String("5")`）：本次运行看着对，
+    ///     重启后读侧按「类型不符」回落默认 —— 用户会以为设置没保存住。
+    #[test]
+    fn the_setters_write_the_backup_and_the_snapshot_together() {
+        let _guard = hold_config();
+        // 起点固定：先回到出厂态，免得别的用例留下的状态改变这里的判据
+        let _ = set_auto_continue_patch(AutoContinuePatch {
+            enabled: Some(false),
+            max_rounds: Some(DEFAULT_AUTO_CONTINUE_MAX_ROUNDS),
+        });
+
+        let saved = set_auto_continue(true);
+        assert_eq!(saved, db().is_some(), "返回值只该由「落库成不成功」决定（测试进程里没有库）");
+        assert!(auto_continue(), "开关必须能被在线打开（轻量读取走的是解析字段）");
+        assert_eq!(current().raw()[KEY_AUTO_CONTINUE], json!(true), "底稿里必须带上这一项，否则写盘写不出它");
+        assert!(current().auto_continue(), "快照 getter 与轻量读取必须是同一个值");
+        assert_eq!(
+            auto_continue_rounds_from(current().raw()),
+            DEFAULT_AUTO_CONTINUE_MAX_ROUNDS,
+            "只动开关不许把上限一并固化成默认之外的值"
+        );
+
+        set_auto_continue_max_rounds(AUTO_CONTINUE_MAX_ROUNDS);
+        assert_eq!(auto_continue_max_rounds(), AUTO_CONTINUE_MAX_ROUNDS, "上限必须能被在线收到边界值");
+        assert_eq!(current().raw()[KEY_AUTO_CONTINUE_MAX_ROUNDS], json!(8), "底稿里要落成一个 JSON 数字");
+        assert!(auto_continue(), "改上限时开关必须保持原样（部分更新不是整份替换）");
+
+        // 两项一起写（PUT 的形状）：一次 update 就该把两项都对齐
+        set_auto_continue_patch(AutoContinuePatch {
+            enabled: Some(false),
+            max_rounds: Some(AUTO_CONTINUE_MIN_ROUNDS),
+        });
+        assert!(!auto_continue());
+        assert_eq!(auto_continue_max_rounds(), AUTO_CONTINUE_MIN_ROUNDS);
+
+        // 复位出厂态：别把「开着 + 1 轮」留给后面的用例（尤其留给续写那条链）
+        let _ = set_auto_continue_patch(AutoContinuePatch {
+            enabled: Some(false),
+            max_rounds: Some(DEFAULT_AUTO_CONTINUE_MAX_ROUNDS),
+        });
+    }
+}

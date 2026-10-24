@@ -1,0 +1,458 @@
+/* ─────────────────────────────────────────────
+   Agent2API · 组件库设计令牌
+
+   取值来源：omniui-react 设计稿的 theme.css。那份设计稿不进仓库 —— 它不是本项目的
+   产物、带 omniui-react 的私有版权头，且取值已全部承接到下面的 --ui-* 变量上
+   （本文件才是唯一事实来源，改令牌改这里）。
+   另补一层控件令牌（--ui-control-* / --ui-surface-3 / --ui-text-2 等），
+   取自 ui/css/tokens.css 里既有的控件观感 —— 组件库要能逐像素复刻现有界面。
+
+   为什么变量名统一加 `--ui-` 前缀：
+   ui/css/tokens.css 已经定义了 --primary / --border / --radius / --font-sans
+   等同名变量，且取值不同（例如 --border 那边是半透明黑 oklch(0.145 0 0 / 10%)，
+   设计稿是实色 oklch(0.93 0 0)）。两套同名变量在 :root 上会按加载顺序互相覆盖，
+   老页面所有 var(--border) 的描边颜色都会跟着变。前缀隔离后各用各的，
+   将来统一令牌只需把老 CSS 的引用逐处改指 --ui-*。
+
+   主题机制与 ui/css/tokens.css 保持一致：:root[data-theme="dark"] 显式深色，
+   :root[data-theme="system"] 在 prefers-color-scheme: dark 下取深色值
+   （app.js 的 applyTheme 写的是 data-theme，不是 .dark class）。
+   ───────────────────────────────────────────── */
+
+/* dark: 变体跟着 data-theme 走，而不是 shadcn 默认的 .dark class。
+   两个分支都要有：显式 dark 与 system 跟随，后者靠媒体查询兜住。 */
+@custom-variant dark {
+  &:where([data-theme='dark'], [data-theme='dark'] *) {
+    @slot;
+  }
+  @media (prefers-color-scheme: dark) {
+    &:where([data-theme='system'], [data-theme='system'] *) {
+      @slot;
+    }
+  }
+}
+
+@theme inline {
+  --font-sans: var(--ui-font-sans);
+  --font-mono: var(--ui-font-mono);
+
+  --color-background: var(--ui-background);
+  --color-foreground: var(--ui-foreground);
+  --color-card: var(--ui-card);
+  --color-card-foreground: var(--ui-card-foreground);
+  --color-popover: var(--ui-popover);
+  --color-popover-foreground: var(--ui-popover-foreground);
+  --color-primary: var(--ui-primary);
+  --color-primary-foreground: var(--ui-primary-foreground);
+  /* 品牌浅底 / 品牌深字：分段选中、导航选中这类「点亮」态用的那一对 */
+  --color-primary-soft: var(--ui-primary-soft);
+  --color-primary-fg: var(--ui-primary-fg);
+  --color-primary-bd: var(--ui-primary-bd);
+  /* 选中项计数徽标的底：主色 16% 的透明 tint（不是实底，叠在滑块上） */
+  --color-primary-tint: var(--ui-primary-tint);
+  --color-secondary: var(--ui-secondary);
+  --color-secondary-foreground: var(--ui-secondary-foreground);
+  --color-muted: var(--ui-muted);
+  --color-muted-foreground: var(--ui-muted-foreground);
+  --color-accent: var(--ui-accent);
+  --color-accent-foreground: var(--ui-accent-foreground);
+  --color-destructive: var(--ui-destructive);
+  --color-destructive-foreground: var(--ui-destructive-foreground);
+  --color-success: var(--ui-success);
+  --color-success-foreground: var(--ui-success-foreground);
+  --color-warning: var(--ui-warning);
+  --color-warning-foreground: var(--ui-warning-foreground);
+  --color-info: var(--ui-info);
+  --color-info-foreground: var(--ui-info-foreground);
+  --color-neutral: var(--ui-neutral);
+  --color-neutral-foreground: var(--ui-neutral-foreground);
+  --color-border: var(--ui-border);
+  --color-input: var(--ui-input);
+  --color-ring: var(--ui-ring);
+
+  /* 控件层：表单控件与按钮的填充、描边，比表面深一档 */
+  --color-surface: var(--ui-surface);
+  --color-surface-2: var(--ui-surface-2);
+  --color-surface-inset: var(--ui-surface-inset);
+  /* 浮层底：比卡片亮一档，浮层才像浮在控件之上 */
+  --color-raised: var(--ui-raised);
+  --color-border-strong: var(--ui-border-strong);
+  --color-hairline: var(--ui-hairline);
+  /* 弹窗遮罩：两个主题都压暗，基底固定为黑（用语义色会在深色主题刷白雾） */
+  --color-mask: var(--ui-mask);
+  --color-control: var(--ui-control-bg);
+  --color-control-hover: var(--ui-control-hover);
+  --color-control-border: var(--ui-control-border);
+  --color-control-border-hover: var(--ui-control-border-hover);
+  --color-surface-3: var(--ui-surface-3);
+  --color-primary-hover: var(--ui-primary-hover);
+  /* 主色底上的前景：从承载面向白提亮派生，浅色得纯白、深色得近白 */
+  --color-primary-on: var(--ui-primary-on);
+  /* 语义色的柔底 / 描边（-soft 是「语义色 × 白」的实底，不是 alpha 叠加） */
+  --color-destructive-soft: var(--ui-destructive-soft);
+  --color-destructive-bd: var(--ui-destructive-bd);
+  --color-destructive-hover: var(--ui-destructive-hover);
+  --color-success-soft: var(--ui-success-soft);
+  --color-success-bd: var(--ui-success-bd);
+  --color-warning-soft: var(--ui-warning-soft);
+  --color-warning-bd: var(--ui-warning-bd);
+  --color-info-soft: var(--ui-info-soft);
+  --color-info-bd: var(--ui-info-bd);
+  /* 版本标签（国内版 / 国际版）的固定配色 */
+  --color-cn: var(--ui-cn);
+  --color-cn-soft: var(--ui-cn-soft);
+  --color-cn-bd: var(--ui-cn-bd);
+  --color-intl: var(--ui-intl);
+  --color-intl-soft: var(--ui-intl-soft);
+  --color-intl-bd: var(--ui-intl-bd);
+  /* 敏感词命中标签的紫（Badge 的 sensitive 档） */
+  --color-sensitive: var(--ui-sensitive);
+  --color-sensitive-soft: var(--ui-sensitive-soft);
+  --color-sensitive-bd: var(--ui-sensitive-bd);
+  /* 次级文字中间档（--text-2）：muted-foreground 是第三档（--text-3） */
+  --color-subtle: var(--ui-text-2);
+  --color-nav-hover: var(--ui-nav-hover);
+  /* 导航项 / 左栏的配色（NavItem 用）。
+     这几个是 ui/css/tokens.css 已经定好、并且随主题自动翻转的令牌 —— 组件库
+     不另立一份取值，而是**引用**它们（取不到时用同一档的兜底值）。
+     复制取值会有两处真源：主题一改就漂移，而这类「选中态底色」的漂移肉眼很难发现。
+     兜底值仅供组件库在宿主没加载 tokens.css 时单独使用。 */
+  --color-sidebar-fg: var(--sidebar-fg, oklch(0.43287 0.01676 258.37));
+  --color-sidebar-muted: var(--sidebar-muted, oklch(0.512 0.02088 261.29));
+  --color-rail-bg: var(--rail-bg, oklch(0.955 0.004 286));
+  --color-nav-selected-bg: var(--nav-selected-bg, oklch(0.89318 0.04237 253.82));
+  --color-nav-selected-border: var(--nav-selected-border, oklch(0.83311 0.05788 254.15));
+  --color-nav-selected-fg: var(--nav-selected-fg, oklch(0.42649 0.12275 255.6));
+
+  --color-chart-1: var(--ui-chart-1);
+  --color-chart-2: var(--ui-chart-2);
+  --color-chart-3: var(--ui-chart-3);
+  --color-chart-4: var(--ui-chart-4);
+  --color-chart-5: var(--ui-chart-5);
+  --color-sidebar: var(--ui-sidebar);
+  --color-sidebar-foreground: var(--ui-sidebar-foreground);
+  --color-sidebar-primary: var(--ui-sidebar-primary);
+  --color-sidebar-primary-foreground: var(--ui-sidebar-primary-foreground);
+  --color-sidebar-accent: var(--ui-sidebar-accent);
+  --color-sidebar-accent-foreground: var(--ui-sidebar-accent-foreground);
+  --color-sidebar-border: var(--ui-sidebar-border);
+  --color-sidebar-ring: var(--ui-sidebar-ring);
+  --color-skeleton-base: var(--ui-skeleton-base);
+  --color-skeleton-highlight: var(--ui-skeleton-highlight);
+
+  --radius-xs: calc(var(--ui-radius) * 0.5);
+  --radius-sm: calc(var(--ui-radius) * 0.6);
+  --radius-md: calc(var(--ui-radius) * 0.8);
+  --radius-lg: var(--ui-radius);
+  --radius-xl: calc(var(--ui-radius) * 1.4);
+  --radius-2xl: calc(var(--ui-radius) * 1.8);
+  --radius-3xl: calc(var(--ui-radius) * 2.2);
+  --radius-4xl: calc(var(--ui-radius) * 2.6);
+  --radius-pill: 999px;
+
+  --shadow-1: var(--ui-shadow-1);
+  --shadow-2: var(--ui-shadow-2);
+  --shadow-3: var(--ui-shadow-3);
+  --shadow-glow: var(--ui-glow);
+  /* 焦点环：整条 box-shadow，组件里用 focus-visible:shadow-focus 引用 */
+  --shadow-focus: var(--ui-focus-ring);
+}
+
+:root {
+  --ui-radius: 1rem;
+  /* 字体栈首位的 Public Sans 与设计稿一致，但项目尚未引入字体文件
+     （@fontsource-variable/public-sans），当前实际落在系统字体上 —— 与
+     既有界面同款。装上字体包即自动切换，无需改这里。 */
+  --ui-font-sans: 'Public Sans', 'Segoe UI', 'Microsoft YaHei', 'Microsoft YaHei UI',
+    system-ui, sans-serif;
+  --ui-font-mono: Consolas, 'Cascadia Mono', 'Courier New', monospace;
+
+  --ui-background: oklch(1 0 0);
+  --ui-foreground: oklch(0.145 0 0);
+  --ui-card: oklch(1 0 0);
+  --ui-card-foreground: oklch(0.145 0 0);
+  --ui-popover: oklch(1 0 0);
+  --ui-popover-foreground: oklch(0.145 0 0);
+  --ui-primary: oklch(0.603 0.218 257.3);
+  --ui-primary-foreground: oklch(1 0 0);
+  --ui-secondary: oklch(0.95 0 0);
+  --ui-secondary-foreground: oklch(0.42 0.16 250);
+  --ui-muted: oklch(0.97 0 0);
+  --ui-muted-foreground: oklch(0.49 0 0);
+  /* 高亮/选中底 = 主蓝 10% 的 sRGB 淡影（#e5f2ff）；
+     oklch color-mix 蓝+白会 hue 跑偏成粉，禁用。 */
+  --ui-accent: color-mix(in srgb, var(--ui-primary) 10%, white);
+  --ui-accent-foreground: oklch(0.145 0 0);
+  --ui-destructive: oklch(0.577 0.245 27.325);
+  --ui-destructive-foreground: oklch(0.985 0 0);
+  --ui-success: oklch(0.596 0.145 163.225);
+  --ui-success-foreground: oklch(0.985 0 0);
+  --ui-warning: oklch(0.681 0.162 75.834);
+  --ui-warning-foreground: oklch(0.145 0 0);
+  --ui-info: oklch(0.588 0.158 241.966);
+  --ui-info-foreground: oklch(0.985 0 0);
+  --ui-neutral: oklch(0.708 0 0);
+  --ui-neutral-foreground: oklch(0.145 0 0);
+  --ui-border: oklch(0.93 0 0);
+  --ui-input: oklch(0.93 0 0);
+  --ui-ring: oklch(0.708 0.16 249.003);
+
+  --ui-primary-soft: color-mix(in srgb, var(--ui-primary) 10%, white);
+  --ui-primary-fg: oklch(0.48 0.2 257.3);
+  --ui-primary-bd: color-mix(in srgb, var(--ui-primary) 28%, white);
+  --ui-primary-tint: color-mix(in srgb, var(--ui-primary) 16%, transparent);
+  --ui-primary-hover: oklch(0.543 0.218 257.3);
+  --ui-primary-on: color-mix(in srgb, var(--ui-surface) 8%, white);
+  --ui-surface: oklch(1 0 0);
+  --ui-surface-2: oklch(0.9767 0.00265 286.35);
+  --ui-surface-inset: oklch(0.93517 0.00535 286.3);
+  --ui-raised: oklch(1 0 0);
+  --ui-border-strong: oklch(0.145 0 0 / 20%);
+  --ui-hairline: oklch(0.145 0 0 / 8%);
+  --ui-mask: color-mix(in srgb, black 46%, transparent);
+  --ui-destructive-soft: color-mix(in srgb, var(--ui-destructive) 10%, white);
+  --ui-destructive-bd: color-mix(in srgb, var(--ui-destructive) 28%, white);
+  --ui-destructive-hover: color-mix(in srgb, var(--ui-destructive) 22%, var(--ui-surface));
+  --ui-success-soft: color-mix(in srgb, var(--ui-success) 10%, white);
+  --ui-success-bd: color-mix(in srgb, var(--ui-success) 28%, white);
+  --ui-warning-soft: color-mix(in srgb, var(--ui-warning) 10%, white);
+  --ui-warning-bd: color-mix(in srgb, var(--ui-warning) 28%, white);
+  --ui-info-soft: color-mix(in srgb, var(--ui-info) 10%, white);
+  --ui-info-bd: color-mix(in srgb, var(--ui-info) 28%, white);
+  --ui-cn: oklch(0.577 0.245 27.325);
+  --ui-cn-soft: color-mix(in srgb, var(--ui-cn) 10%, white);
+  --ui-cn-bd: color-mix(in srgb, var(--ui-cn) 28%, white);
+  --ui-intl: oklch(0.52 0.16 268);
+  --ui-intl-soft: color-mix(in srgb, var(--ui-intl) 10%, white);
+  --ui-intl-bd: color-mix(in srgb, var(--ui-intl) 28%, white);
+  /* 敏感词命中标签的紫：它是**第三类**状态，不能借用 cn（红，读起来像失败）或
+     intl（靛蓝，与「国际版」语义绑着）。取值与 ui/css/page-requests.css 里
+     那套手写紫逐字一致 —— 迁移期间两处并存，改一处必须改另一处。 */
+  --ui-sensitive: oklch(0.45 0.18 305);
+  --ui-sensitive-soft: oklch(0.55 0.18 305 / 14%);
+  --ui-sensitive-bd: oklch(0.55 0.18 305 / 32%);
+  --ui-control-bg: oklch(0.95815 0 0);
+  --ui-control-hover: oklch(0.93214 0.00536 286.3);
+  --ui-control-border: oklch(0.145 0 0 / 14%);
+  --ui-control-border-hover: oklch(0.145 0 0 / 24%);
+  --ui-surface-3: oklch(0.95 0 0);
+  --ui-text-2: oklch(0.37 0 0);
+  --ui-nav-hover: oklch(0.145 0 0 / 5%);
+
+  --ui-chart-1: oklch(0.72 0.18 250);
+  --ui-chart-2: oklch(0.65 0.15 200);
+  --ui-chart-3: oklch(0.7 0.12 280);
+  --ui-chart-4: oklch(0.68 0.19 325);
+  --ui-chart-5: oklch(0.68 0.16 155);
+  --ui-sidebar: color-mix(in oklch, var(--ui-foreground) 0.5%, var(--ui-background));
+  --ui-sidebar-foreground: oklch(0.145 0 0);
+  --ui-sidebar-primary: oklch(0.64 0.197 253.892);
+  --ui-sidebar-primary-foreground: oklch(1 0 0);
+  --ui-sidebar-accent: color-mix(in srgb, var(--ui-primary) 10%, white);
+  --ui-sidebar-accent-foreground: oklch(0.579 0.196 255.909);
+  --ui-sidebar-border: oklch(0.93 0 0);
+  --ui-sidebar-ring: oklch(0.58 0.2 250);
+  --ui-skeleton-base: oklch(0.97 0 0);
+  --ui-skeleton-highlight: oklch(0.985 0 0);
+
+  --ui-shadow-1: 0 1px 2px oklch(0.145 0 0 / 5%);
+  --ui-shadow-2: 0 1px 3px oklch(0.145 0 0 / 6%), 0 10px 26px -16px oklch(0.145 0 0 / 20%);
+  --ui-shadow-3: 0 2px 8px oklch(0.145 0 0 / 7%), 0 22px 54px -22px oklch(0.145 0 0 / 26%);
+  --ui-glow: 0 1px 2px oklch(0.145 0 0 / 6%),
+    0 10px 22px -12px color-mix(in srgb, var(--ui-primary) 45%, transparent);
+  /* 焦点环是整条 box-shadow，不是颜色 —— 组件里用 shadow-focus 工具类引用 */
+  --ui-focus-ring: 0 0 0 3px color-mix(in srgb, var(--ui-primary) 25%, transparent);
+}
+
+:root[data-theme='dark'] {
+  --ui-background: oklch(0.235 0 0);
+  --ui-foreground: oklch(0.965 0 0);
+  --ui-card: oklch(0.285 0 0);
+  --ui-card-foreground: oklch(0.965 0 0);
+  --ui-popover: oklch(0.305 0 0);
+  --ui-popover-foreground: oklch(0.965 0 0);
+  --ui-primary: oklch(0.623 0.206 255.3);
+  --ui-primary-foreground: oklch(1 0 0);
+  --ui-secondary: oklch(0.335 0 0);
+  --ui-secondary-foreground: oklch(0.9 0.05 250);
+  --ui-muted: oklch(0.305 0 0);
+  --ui-muted-foreground: oklch(0.78 0 0);
+  /* 深色高亮 = 主色实底（苹果菜单/控件做法），配白字 */
+  --ui-accent: var(--ui-primary);
+  --ui-accent-foreground: oklch(1 0 0);
+  --ui-destructive: oklch(0.704 0.191 22.216);
+  --ui-destructive-foreground: oklch(0.985 0 0);
+  --ui-success: oklch(0.696 0.17 162.48);
+  --ui-success-foreground: oklch(0.145 0 0);
+  --ui-warning: oklch(0.769 0.188 70.08);
+  --ui-warning-foreground: oklch(0.145 0 0);
+  --ui-info: oklch(0.613 0.14 239.919);
+  --ui-info-foreground: oklch(0.145 0 0);
+  --ui-neutral: oklch(0.76 0 0);
+  --ui-neutral-foreground: oklch(0.155 0 0);
+  --ui-border: oklch(1 0 0 / 10%);
+  --ui-input: oklch(1 0 0 / 17%);
+  --ui-ring: oklch(0.554 0.148 250.726);
+
+  --ui-primary-soft: oklch(0.623 0.206 255.3 / 15%);
+  --ui-primary-fg: oklch(0.75 0.12 255.3);
+  --ui-primary-bd: oklch(0.623 0.206 255.3 / 38%);
+  --ui-primary-tint: color-mix(in srgb, var(--ui-primary) 16%, transparent);
+  --ui-primary-hover: oklch(0.68 0.206 255.3);
+  --ui-primary-on: color-mix(in srgb, var(--ui-surface) 8%, white);
+  --ui-surface: oklch(0.19212 0.00399 286.02);
+  --ui-surface-2: oklch(0.28254 0.00726 285.93);
+  --ui-surface-inset: oklch(0.215 0.005 286);
+  --ui-raised: oklch(0.3 0.005 286);
+  --ui-border-strong: oklch(1 0 0 / 20%);
+  --ui-hairline: oklch(1 0 0 / 9%);
+  --ui-mask: color-mix(in srgb, black 46%, transparent);
+  --ui-destructive-soft: oklch(0.704 0.191 22.216 / 14%);
+  --ui-destructive-bd: oklch(0.704 0.191 22.216 / 32%);
+  --ui-destructive-hover: color-mix(in srgb, var(--ui-destructive) 22%, var(--ui-surface));
+  --ui-success-soft: oklch(0.696 0.17 162.48 / 14%);
+  --ui-success-bd: oklch(0.696 0.17 162.48 / 32%);
+  --ui-warning-soft: oklch(0.769 0.188 70.08 / 14%);
+  --ui-warning-bd: oklch(0.769 0.188 70.08 / 32%);
+  --ui-info-soft: oklch(0.613 0.14 239.919 / 14%);
+  --ui-info-bd: oklch(0.613 0.14 239.919 / 32%);
+  --ui-cn: oklch(0.704 0.191 22.216);
+  --ui-cn-soft: oklch(0.704 0.191 22.216 / 14%);
+  --ui-cn-bd: oklch(0.704 0.191 22.216 / 32%);
+  --ui-intl: oklch(0.68 0.14 268);
+  --ui-intl-soft: oklch(0.68 0.14 268 / 14%);
+  --ui-intl-bd: oklch(0.68 0.14 268 / 32%);
+  --ui-sensitive: oklch(0.82 0.12 305);
+  --ui-sensitive-soft: oklch(0.7 0.16 305 / 16%);
+  --ui-sensitive-bd: oklch(0.7 0.16 305 / 34%);
+  --ui-control-bg: oklch(0.36572 0.0085 285.97);
+  --ui-control-hover: oklch(0.40758 0.00993 285.95);
+  --ui-control-border: oklch(1 0 0 / 15%);
+  --ui-control-border-hover: oklch(1 0 0 / 25%);
+  --ui-surface-3: oklch(0.32737 0.0105 285.81);
+  --ui-text-2: oklch(0.85 0 0);
+  --ui-nav-hover: oklch(1 0 0 / 6%);
+
+  --ui-chart-1: oklch(0.76 0.14 250);
+  --ui-chart-2: oklch(0.76 0.13 200);
+  --ui-chart-3: oklch(0.76 0.13 285);
+  --ui-chart-4: oklch(0.75 0.16 325);
+  --ui-chart-5: oklch(0.76 0.14 155);
+  --ui-sidebar: oklch(0.225 0 0);
+  --ui-sidebar-foreground: oklch(0.95 0 0);
+  --ui-sidebar-primary: oklch(0.588 0.123 246.488);
+  --ui-sidebar-primary-foreground: oklch(1 0 0);
+  --ui-sidebar-accent: oklch(1 0 0 / 9%);
+  --ui-sidebar-accent-foreground: var(--ui-primary);
+  --ui-sidebar-border: oklch(1 0 0 / 11%);
+  --ui-sidebar-ring: oklch(0.7 0.17 250);
+  --ui-skeleton-base: oklch(0.335 0 0);
+  --ui-skeleton-highlight: oklch(0.44 0 0);
+
+  --ui-shadow-1: 0 1px 2px oklch(0 0 0 / 40%);
+  --ui-shadow-2: 0 1px 2px oklch(0 0 0 / 40%), 0 12px 28px -18px oklch(0 0 0 / 80%);
+  --ui-shadow-3: 0 2px 10px oklch(0 0 0 / 45%), 0 26px 60px -24px oklch(0 0 0 / 85%);
+  --ui-glow: 0 1px 2px oklch(0 0 0 / 40%), 0 10px 22px -14px oklch(0.623 0.206 255.3 / 50%);
+  --ui-focus-ring: 0 0 0 3px oklch(0.623 0.206 255.3 / 30%);
+}
+
+/* system 模式跟随系统深浅，与 ui/css/tokens.css 同款写法。
+
+   ⚠️ 下面这一块的取值必须与上面 :root[data-theme='dark'] **逐字一致**，只换选择器。
+   两块都要有是 CSS 的硬约束：媒体查询没法并进选择器列表，而 `light-dark()` 在
+   旧 WebView 上不被支持（一旦不支持，整条声明会退化成未定义值，界面直接崩），
+   所以只能老老实实抄两遍。曾经因为只抄了一部分（漏了 --ui-surface 一族与全部
+   语义色的 -soft/-bd），「跟随系统」进深色时弹窗底仍是白的、字却是浅色，
+   在白底上几乎看不见 —— 改这里时请整块对照，别只补单个变量。 */
+@media (prefers-color-scheme: dark) {
+  :root[data-theme='system'] {
+    --ui-background: oklch(0.235 0 0);
+    --ui-foreground: oklch(0.965 0 0);
+    --ui-card: oklch(0.285 0 0);
+    --ui-card-foreground: oklch(0.965 0 0);
+    --ui-popover: oklch(0.305 0 0);
+    --ui-popover-foreground: oklch(0.965 0 0);
+    --ui-primary: oklch(0.623 0.206 255.3);
+    --ui-primary-foreground: oklch(1 0 0);
+    --ui-secondary: oklch(0.335 0 0);
+    --ui-secondary-foreground: oklch(0.9 0.05 250);
+    --ui-muted: oklch(0.305 0 0);
+    --ui-muted-foreground: oklch(0.78 0 0);
+    --ui-accent: var(--ui-primary);
+    --ui-accent-foreground: oklch(1 0 0);
+    --ui-destructive: oklch(0.704 0.191 22.216);
+    --ui-destructive-foreground: oklch(0.985 0 0);
+    --ui-success: oklch(0.696 0.17 162.48);
+    --ui-success-foreground: oklch(0.145 0 0);
+    --ui-warning: oklch(0.769 0.188 70.08);
+    --ui-warning-foreground: oklch(0.145 0 0);
+    --ui-info: oklch(0.613 0.14 239.919);
+    --ui-info-foreground: oklch(0.145 0 0);
+    --ui-neutral: oklch(0.76 0 0);
+    --ui-neutral-foreground: oklch(0.155 0 0);
+    --ui-border: oklch(1 0 0 / 10%);
+    --ui-input: oklch(1 0 0 / 17%);
+    --ui-ring: oklch(0.554 0.148 250.726);
+
+    --ui-primary-soft: oklch(0.623 0.206 255.3 / 15%);
+    --ui-primary-fg: oklch(0.75 0.12 255.3);
+    --ui-primary-bd: oklch(0.623 0.206 255.3 / 38%);
+    --ui-primary-tint: color-mix(in srgb, var(--ui-primary) 16%, transparent);
+    --ui-primary-hover: oklch(0.68 0.206 255.3);
+    --ui-primary-on: color-mix(in srgb, var(--ui-surface) 8%, white);
+    --ui-surface: oklch(0.19212 0.00399 286.02);
+    --ui-surface-2: oklch(0.28254 0.00726 285.93);
+    --ui-surface-inset: oklch(0.215 0.005 286);
+    --ui-raised: oklch(0.3 0.005 286);
+    --ui-border-strong: oklch(1 0 0 / 20%);
+    --ui-hairline: oklch(1 0 0 / 9%);
+    --ui-mask: color-mix(in srgb, black 46%, transparent);
+    --ui-destructive-soft: oklch(0.704 0.191 22.216 / 14%);
+    --ui-destructive-bd: oklch(0.704 0.191 22.216 / 32%);
+    --ui-destructive-hover: color-mix(in srgb, var(--ui-destructive) 22%, var(--ui-surface));
+    --ui-success-soft: oklch(0.696 0.17 162.48 / 14%);
+    --ui-success-bd: oklch(0.696 0.17 162.48 / 32%);
+    --ui-warning-soft: oklch(0.769 0.188 70.08 / 14%);
+    --ui-warning-bd: oklch(0.769 0.188 70.08 / 32%);
+    --ui-info-soft: oklch(0.613 0.14 239.919 / 14%);
+    --ui-info-bd: oklch(0.613 0.14 239.919 / 32%);
+    --ui-cn: oklch(0.704 0.191 22.216);
+    --ui-cn-soft: oklch(0.704 0.191 22.216 / 14%);
+    --ui-cn-bd: oklch(0.704 0.191 22.216 / 32%);
+    --ui-intl: oklch(0.68 0.14 268);
+    --ui-intl-soft: oklch(0.68 0.14 268 / 14%);
+    --ui-intl-bd: oklch(0.68 0.14 268 / 32%);
+    --ui-sensitive: oklch(0.82 0.12 305);
+    --ui-sensitive-soft: oklch(0.7 0.16 305 / 16%);
+    --ui-sensitive-bd: oklch(0.7 0.16 305 / 34%);
+    --ui-control-bg: oklch(0.36572 0.0085 285.97);
+    --ui-control-hover: oklch(0.40758 0.00993 285.95);
+    --ui-control-border: oklch(1 0 0 / 15%);
+    --ui-control-border-hover: oklch(1 0 0 / 25%);
+    --ui-surface-3: oklch(0.32737 0.0105 285.81);
+    --ui-text-2: oklch(0.85 0 0);
+    --ui-nav-hover: oklch(1 0 0 / 6%);
+
+    --ui-chart-1: oklch(0.76 0.14 250);
+    --ui-chart-2: oklch(0.76 0.13 200);
+    --ui-chart-3: oklch(0.76 0.13 285);
+    --ui-chart-4: oklch(0.75 0.16 325);
+    --ui-chart-5: oklch(0.76 0.14 155);
+    --ui-sidebar: oklch(0.225 0 0);
+    --ui-sidebar-foreground: oklch(0.95 0 0);
+    --ui-sidebar-primary: oklch(0.588 0.123 246.488);
+    --ui-sidebar-primary-foreground: oklch(1 0 0);
+    --ui-sidebar-accent: oklch(1 0 0 / 9%);
+    --ui-sidebar-accent-foreground: var(--ui-primary);
+    --ui-sidebar-border: oklch(1 0 0 / 11%);
+    --ui-sidebar-ring: oklch(0.7 0.17 250);
+    --ui-skeleton-base: oklch(0.335 0 0);
+    --ui-skeleton-highlight: oklch(0.44 0 0);
+
+    --ui-shadow-1: 0 1px 2px oklch(0 0 0 / 40%);
+    --ui-shadow-2: 0 1px 2px oklch(0 0 0 / 40%), 0 12px 28px -18px oklch(0 0 0 / 80%);
+    --ui-shadow-3: 0 2px 10px oklch(0 0 0 / 45%), 0 26px 60px -24px oklch(0 0 0 / 85%);
+    --ui-glow: 0 1px 2px oklch(0 0 0 / 40%), 0 10px 22px -14px oklch(0.623 0.206 255.3 / 50%);
+    --ui-focus-ring: 0 0 0 3px oklch(0.623 0.206 255.3 / 30%);
+  }
+}

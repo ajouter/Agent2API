@@ -1,0 +1,210 @@
+[package]
+name = "workbuddy-proxy-desktop"
+version = "3.0.8"
+description = "Agent2API 桌面端 — 多提供商本地网关与会话管理"
+authors = ["aimod-cc"]
+edition = "2021"
+# MSRV 由 rusqlite 0.40 → libsqlite3-sys 0.38 决定（它的声明值是 1.88）。
+# 本机工具链是 1.95，能编；但声明值必须与实际要求一致 —— 声明 1.77 却
+# 要求 1.88，会让「照着 rust-version 装旧工具链」的构建直接失败。
+rust-version = "1.88"
+# 许可：LICENSE 正文是逐字的标准 MIT 条款，但文件末尾附有「使用声明」，
+# 其第 3 条禁止商业用途 / 二次分发牟利，属于 MIT 之外的附加限制；
+# 根 README「许可」一节也写明两者共同构成完整的授权与使用约定。
+# 因此不单独声明 SPDX 的 "MIT"（会漏掉附加限制），改为指向实际的 LICENSE 文件。
+license-file = "../../LICENSE"
+repository = "https://github.com/aimod-cc/agent2api"
+homepage = "https://github.com/aimod-cc/agent2api"
+
+# ── workspace ───────────────────────────────────────────────
+# 网关本体拆成了独立 crate（`server/`，桌面与 headless 二进制共用）。
+# workspace 让两个 crate 共享一个 target/ 与 Cargo.lock，公共依赖
+# （tokio / reqwest / rusqlite…）只编译一次。[profile.release] 由
+# workspace root（本文件）统一提供。
+[workspace]
+members = ["server"]
+
+[lib]
+name = "workbuddy_proxy_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# 网关本体（独立 crate）：桌面壳进程内跑它的 HTTP 服务器，
+# headless 二进制（agent2api-server）也链接同一个 lib
+agent2api-server = { path = "server" }
+# tray-icon 提供系统托盘，image-png 用于解析 bundle 图标（托盘图标直接复用它，不新增图片资源）
+# devtools：把 WebView 开发者工具（F12 / 右键「检查」）编译进 release 安装包。
+# 没有它 wry 在 release 下默认 SetAreDevToolsEnabled(false)，按 F12 没有反应。
+# 开关在下方 [target.'cfg(windows)'.dependencies]（分目标追加特性）：
+# Windows 的 WebView2 DevTools 走微软公开 API，release 开启无副作用；macOS 的
+# WKWebView 开 devtools 依赖 Apple 私有 API，wry 官方不建议 release 开，故只在
+# Windows 上追加（debug / dev 构建两个平台都照常有 devtools，不受影响）。
+# 注意：Windows 构建时这段与下方 windows 段的 tauri 特性**合并**生效，
+# 下方必须写全 tray-icon / image-png，否则托盘等特性会在 Windows 上丢失。
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 后端已改为「壳进程内 HTTP 服务器」，相应开启所需特性：
+# rt-multi-thread/macros 起运行时，net 监听端口，sync 传停机信号，
+# fs/io-util 读写配置与日志文件（后续切片的流式转发继续用 io-util/time）
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util", "fs"] }
+url = "2"
+# 进程内 HTTP 服务器：路由、body 限制、中间件都由它提供
+axum = "0.8"
+# 管理 API 走本机 127.0.0.1 明文 HTTP；后续切片要用它访问 https 上游
+# （copilot.tencent.com）与 GitHub Release，所以必须带一套 TLS 实现。
+# 用 rustls + ring：纯 Rust 实现，不依赖系统 openssl、也不需要 nasm，
+# 打包与交叉编译都没有额外平台负担。
+# socks：账号出网代理支持 socks5（切片 3）—— 没有它 `http://` 之外的代理
+# URI 会被 reqwest 拒绝（unknown proxy scheme），自定义 socks5 出口直接不可用。
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks"] }
+# 解析 Clash Verge 的 verge.yaml / profiles.yaml（切片 3：出网代理可选项）
+serde_yaml = "0.9"
+# 请求体去重键（后续切片：转发链路）
+sha2 = "0.10"
+# 签到调度时刻、token 过期时间的本地时间处理（后续切片）
+chrono = "0.4"
+# 上游 SSE 流式转发（切片 4）
+futures = "0.3"
+tokio-stream = "0.1"
+# SSE 帧的字节容器：axum 的 Body::from_stream 与 reqwest 的 bytes_stream
+# 都要用 bytes::Bytes（reqwest 只再导出 Response，不导出 Bytes 本身），
+# 转发链路要自己拼 SSE 帧，所以显式依赖（版本与 axum/reqwest 内部一致）
+bytes = "1"
+# CatPaw 适配器的内联图片压缩（providers/catpaw/image_compress.rs）。上游不拉
+# http 图片、图片只能 base64 内联，>60KB 的图必须缩（最长边 1568 + JPEG 降质）。
+# image 本来就在依赖树里：tauri 的 image-png 特性只开了 png 解码，这里追加
+# jpeg（编码 + 解码）与 webp（解码）—— 同版本同 target 的特性会合并，所以不是
+# 引进第二个 image，只是让已编译的它多带两个编解码器（纯 Rust：zune-jpeg /
+# image-webp，没有 C 编译依赖，也无 nasm 之类的外部工具要求）。
+# 刻意不开 default：rayon（多线程）与 avif/tiff/gif 等其余格式都与本模块无关，
+# 开了只会白涨体积。
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+# data URL 的 base64 解/编码。base64 0.22.1 已经是 reqwest 的非可选依赖
+# （同样走特性合并，不新增 crate、不新增编译产物）。
+base64 = "0.22"
+# Qoder 网页登录的 PKCE verifier / nonce 与机器标识需要**不可预测**的随机串
+# （verifier 是「授权码只能换给本进程」这条保证的全部依据），因此要真正的
+# 密码学随机源，不能沿用 raccoon::oauth 那套「RandomState + 时间戳」的廉价串
+# （那套只够做 CSRF 口径的 state）。getrandom 0.2 本来就在依赖树里
+# （ring / aes-gcm 拉的），这里只是把它提升为直接依赖，不新增编译产物。
+getrandom = "0.2"
+# 出站请求体的指纹脱敏（core/sanitize.rs）：表头键名与 cc_* 键值要按正则整段
+# 剥离。规则集照搬 workbuddy2api 的 sanitize.go，那三条正则的**语义必须逐字对齐**
+# （大小写不敏感、`\b` 关掉 Unicode 模式、`\s` 收窄成 ASCII 空白），用字符串查找
+# 表达不了。regex 1.13.1 本来就在依赖树里（tauri-utils / urlpattern 拉的），
+# 这里只是提升为直接依赖，不新增编译产物。
+regex = "1"
+# AutoClaw 适配器的 encryption 侧（providers/autoclaw/crypto.rs）：Electron
+# safeStorage 的 os_crypt 密文是 AES-256-GCM，密钥由 DPAPI 解出。
+# 刻意 **关掉 default**：默认特性里的 getrandom/rand_core 是给「生成密钥」用的，
+# 我们只做「用已知 key + nonce 解密」，一个随机源都不需要，开了只会白涨依赖。
+# 留下 aes（AES-256 分组密码本体）与 alloc（Aead::decrypt 返回 Vec 必需）——
+# 两者都是纯 Rust（aes / ghash / polyval），无 C 编译依赖、也不要求 nasm。
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
+# AES-128-CBC 分组加密：Qoder COSY 签名要用它加密一次性的身份 JSON
+# （providers/qoder/cosy.rs）。**不是新增编译产物** —— `aes` 0.9 本来就是
+# aes-gcm 的非可选依赖（上面那行的 `aes` 特性就是它），这里只是把它提升为
+# 直接依赖，好在自己的代码里 `use aes::Aes128`。CBC 的链式异或与 PKCS#7 补位
+# 是十几行确定性代码，因此不额外引入 `cbc` + `block-padding` 两个 crate。
+aes = "0.9"
+# AutoClaw 鉴权接口的请求签名：X-Auth-Sign = MD5(appId&timestamp&appKey)
+# （providers/autoclaw/credentials.rs 的刷新调用，见 autoclaw-upstream-client.mjs）。
+# 只加它自己：digest 0.10.7 与 cfg-if 都已被 sha2 拉进依赖树（特性合并，不新增）。
+# MD5 在这里**不是**安全边界，只是复刻桌面端客户端的固定指纹，不要换成别的摘要。
+md-5 = "0.10"
+# Qoder COSY 签名（providers/qoder/cosy.rs）要用 RSA 公钥加密一把一次性 AES 密钥，
+# 而那条链路上只用到「PKCS#1 v1.5 打包 + 一次模幂」这一步。因此不引入完整的
+# rsa crate（它会拖进 num-bigint-dig / pkcs1 / pkcs8 / der / signature 一长串依赖），
+# num-bigint 就够：大整数 + modpow，打包与随机填充十几行。
+# num-integer 是它的既有依赖（已在依赖树里），不新增编译产物。
+# 正确性已与 Node 的 crypto 对拍（Rust 加密 → Node 私钥解密往返成功，
+# 且 AES-CBC / MD5 / 请求体编码的密文与 Node 逐字节一致）。
+num-bigint = "0.4"
+# 本地存储：数据从「一堆 JSON / JSONL 文件」收敛到单文件 SQLite
+# （`{config_dir}/agent2api.db`，见 server/db/）。之所以现在引入：
+# 现在的形态是「每个 store 各自持一份全量内存快照 + 整文件重写」，
+# 日志/统计/账号三份数据的裁剪、迁移、崩溃恢复各写各的，口径迟早会分叉；
+# 交给 SQLite 之后这些都由事务与索引保证，库是唯一真相。
+#
+# ── 为什么选 rusqlite 而不是 sqlx / sea-orm ───────────────────
+# 本项目全程**同步**访问存储（各 store 内部一把 Mutex，调用点不在 async
+# fn 里）。sqlx 的那套「异步驱动 + 编译期查询校验」需要 async 上下文与
+# 离线元数据，为它把整个存储层改成 async 得不偿失；sea-orm 之类再往上是
+# ORM 与迁移 DSL，而我们的表就 6 张、迁移是几十行确定性代码。rusqlite 是
+# libsqlite3-sys 的薄封装，同步 API 与现有 store 的形状天然对齐。
+#
+# ── 为什么开 bundled ────────────────────────────────────────
+# `bundled` 把 SQLite 的 C 源码（sqlite3.c amalgamation）在**编译期**静态
+# 链接进二进制，于是：
+#   1. 运行时不依赖系统 sqlite3 —— Windows 不自带、macOS 那份版本随系统变，
+#      靠系统库会让「同一份代码在两个平台行为不同」（SQLite 版本差会直接影响
+#      UPSERT / RETURNING / STRICT 表这些语法可用性）；
+#   2. 打包没有额外负担 —— 不用往安装包里塞一个 DLL/dylib，也不用做
+#      codesign / 依赖扫描那一套；
+#   3. 版本可复现 —— 升 rusqlite 就升 SQLite，历史行为不随用户机器漂移。
+# 代价是首次编译要几分钟（cc 编一遍 amalgamation），且需要 C 编译器：
+# 本机 MSVC 工具链已确认可用（ring 已经成功编过），不是新增前置条件。
+#
+# ── 为什么不做连接池（r2d2 / deadpool / 多连接）─────────────
+# 本项目是**单进程单文件**：整个应用只有一个 SQLite 库，写入本来就被 SQLite
+# 串行化（同一时刻只允许一个写事务）。开池子只能并发**读**，而我们的读
+# 也集中在少数几个 API 上、量级远没到需要并发的程度；换来的是每条连接一份
+# 页缓存、WAL 下多写者互相 SQLITE_BUSY、以及「哪个连接看到哪个快照」这类
+# 只在多连接下才存在的 bug。**单连接 + 一把 Mutex** 语义最接近现在的
+# 「内存快照 + 单锁」，迁移期间两边行为好对照。
+# （WAL 下读不阻塞写、写不阻塞读；单个连接照样受益于 WAL，见 server/db/mod.rs。）
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+# 查端口监听者与结束进程树改用纯 Win32 API（iphlpapi 的 GetExtendedTcpTable、
+# Toolhelp 进程快照 + OpenProcess/TerminateProcess）。原先靠 spawn taskkill /
+# powershell 实现，「监听本地端口 + 拉起 powershell 查进程 + taskkill 杀进程」
+# 这套字符串与行为特征命中了杀软（联想电脑管家 / 火绒引擎）对流量拦截类木马的
+# 启发式，进程一启动就被拦杀（报 Trojan/Intercept.a，退出码 0xFFFFFFFF）。
+# 换 API 后导入表里只剩 kernel32 / iphlpapi，不再有任何命令行工具的名字。
+# 只对 Windows 目标生效：非 Windows 平台是桩实现，不需要这份依赖。
+# ── tauri 为什么要在这里重写一遍 ─────────────────────────────
+# 只为追加 devtools 特性。cargo 对「基础段 + 目标段」的同名依赖是特性并集，
+# 但目标段不继承基础段的 features 列表，所以 tray-icon / image-png 必须在这里
+# 重复声明，Windows 构建里才不丢托盘与图标解码；最终只在 Windows 上多带 devtools。
+[target.'cfg(windows)'.dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png", "devtools"] }
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_Networking_WinSock",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Threading",
+] }
+# AutoClaw 适配器要解 Electron safeStorage 的 os_crypt 密钥：DPAPI 的
+# CryptUnprotectData（providers/autoclaw/crypto.rs，架构文档 §10.1 指定的依赖）。
+# ── 为什么是 windows 而不是上面那个 windows-sys ──────────────
+# windows-sys 是**扁平句柄 + 手写 GetLastError**（本文件上方「查端口监听者」
+# 那几项就是这种用法：状态码自己判、错误码自己取）。DPAPI 这里要的是
+# 「一次调用 + 结构化错误 + 释放 DPAPI 分配的内存」，windows crate 正好提供
+# `Result<()>` 错误传播与 `HLOCAL`（带 Drop 语义的 LocalAlloc 句柄），
+# 少一层手写的错误码处理。
+# ── 体积控制 ────────────────────────────────────────────────
+# 只开 Win32_Security_Cryptography 这一个叶子 feature（它自动带上父级
+# Win32_Security → Win32 → Win32_Foundation，所以 LocalFree/HLOCAL 都能用）。
+# Catalog / Certificates / Sip / UI 四个子模块没开，它们的绑定不进编译。
+# 版本锁 0.61：tauri 2.11 已经在用 windows 0.61.3（见 Cargo.lock），
+# 这里只是**给同一个 crate 追加特性**（特性合并），不再引入第二个 windows。
+windows = { version = "0.61", features = ["Win32_Security_Cryptography"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

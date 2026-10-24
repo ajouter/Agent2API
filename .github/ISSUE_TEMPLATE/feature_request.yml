@@ -1,0 +1,25 @@
+name: 💡 功能建议
+description: 想让网关或界面多一个能力、改一处别扭的地方
+title: "[建议] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 你想解决什么
+      description: 说场景比说方案有用 —— 你现在是怎么绕过去的、哪一步别扭，写清楚就好
+      placeholder: 我同时配了好几个账号，每次都要手动……
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你希望的形态
+      description: 心里已经有具体做法的话（按钮放哪、设置项叫什么、默认值是什么）写在这里
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 有没有替代办法
+      description: 现有功能能不能凑合达到目的？为什么不够？

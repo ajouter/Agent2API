@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title data-i18n="Agent2API · 登录">Agent2API · 登录</title>
+  <script>
+    // 语言引导：在 head 解析期定下界面语言，再同步注入词典（与 index.html 同一套，
+    // 解析规则与 ui/i18n.js 的 resolveLocale 逐字一致，改一处要一起改）。
+    // 登录页的静态文案只有 <title>；卡片内容由 React 岛渲染，本页内联登录脚本里的
+    // 中文属后续批次，这里不碰。
+    (function () {
+      var CODES = ['zh-Hans', 'zh-Hant', 'en', 'ja', 'ko', 'pt-BR'];
+      var raw = null;
+      try { raw = localStorage.getItem('workbuddy-desktop-locale'); } catch (e) { /* 存储被禁：按 auto 处理 */ }
+      var locale = 'en';
+      if (raw && raw !== 'auto' && CODES.indexOf(raw) >= 0) {
+        locale = raw;
+      } else {
+        var tags = (navigator.languages && navigator.languages.length) ? navigator.languages : [navigator.language];
+        for (var i = 0; i < tags.length; i++) {
+          var tag = String(tags[i] || '').toLowerCase();
+          if (!tag) continue;
+          if (tag === 'zh-tw' || tag === 'zh-hk' || tag === 'zh-mo' || tag.indexOf('hant') >= 0) { locale = 'zh-Hant'; break; }
+          if (tag.indexOf('zh') === 0) { locale = 'zh-Hans'; break; }
+          if (tag.indexOf('ja') === 0) { locale = 'ja'; break; }
+          if (tag.indexOf('ko') === 0) { locale = 'ko'; break; }
+          if (tag.indexOf('pt') === 0) { locale = 'pt-BR'; break; }
+        }
+      }
+      document.documentElement.lang = locale;
+      if (locale === 'zh-Hans') return; // 简体无词典：查不到即显示简体原文
+      document.write('<script src="i18n/manifest.js"><\/script>');
+      var domains = window.__WB_I18N_DOMAINS || [];
+      for (var d = 0; d < domains.length; d++) {
+        document.write('<script src="i18n/' + locale + '/' + domains[d] + '.js"><\/script>');
+      }
+    })();
+  </script>
+  <!-- 组件库产物（ui-kit + Tailwind，由 ui-islands 构建）：与主面板同一份。
+       页面外壳的取值也改走它的 --ui-* 令牌，不再自己硬编码一套深色变量。 -->
+  <link rel="stylesheet" href="islands/ui.css">
+  <style>
+    /* 样式表里只留 html/body 与第三方 widget 的样式：卡片、品牌区、表单都由 React 岛
+       （ui-islands/src/islands/login-page.tsx）用组件库的工具类渲染。 */
+    body {
+      /* margin: 0 与 box-sizing 是原先那条 `* { margin:0; padding:0; box-sizing:border-box }`
+         全局重置的遗留：组件库的产物刻意不含 preflight（见 index.html 里 ui.css 那条注释），
+         全局重置已随本次改写删掉，缺了这两条 body 会吃浏览器默认的 8px 外边距 ——
+         页面立刻多出 16px 纵向溢出，右侧冒出一条滚动条。 */
+      margin: 0;
+      box-sizing: border-box;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      font: 14px/1.6 var(--ui-font-sans, system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif);
+      color: var(--ui-foreground);
+      /* 顶部主色光晕 + 页面底色：原独立页那层深蓝渐变的等价物，取值改走令牌 */
+      background: radial-gradient(1200px 600px at 50% -10%,
+        color-mix(in srgb, var(--ui-primary) 26%, var(--ui-background)) 0%,
+        var(--ui-background) 55%);
+    }
+    /* 挂载点自身不生成盒子：卡片直接作为 body 的 flex 子项参与居中（与主面板的 .island
+       同一手法）—— 中间多一层 div 的话，卡片的 min(400px,100%) 会按那一层的收缩宽度
+       计算，窄窗口下就偏了 */
+    #login-app { display: contents; }
+    /* 机器人校验组件（ui/panel-captcha.js 定义的 <panel-captcha>）：浅色 DOM、
+       样式留在页面这一层，观感与迁移前的 altcha widget 一致 —— 一行居中、
+       圆角描边方框、左侧指示圈（求解中转圈 / 通过打勾 / 失败描红）。
+       组件只在开启校验时占位：校验关闭后它被隐藏，间距随 display:none 一起消失，
+       与按钮之间的间隔改由 #submit 自己的 margin-top 撑住（两侧各 20px）。 */
+    panel-captcha { display: block; margin: 20px 0 0; }
+    #submit { margin-top: 20px; }
+    panel-captcha .pc-box {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      width: fit-content;
+      max-width: 100%;
+      margin: 0 auto;
+      padding: 10px 14px;
+      border: 1px solid var(--ui-border);
+      border-radius: 8px;
+      background: var(--ui-card);
+      font-size: 13px;
+      cursor: pointer;
+      user-select: none;
+    }
+    panel-captcha .pc-box:hover { border-color: var(--ui-border-strong); }
+    panel-captcha .pc-indicator {
+      width: 18px;
+      height: 18px;
+      flex: none;
+      border: 2px solid var(--ui-border-strong);
+      border-radius: 4px;
+    }
+    panel-captcha[state='verifying'] .pc-indicator {
+      border-radius: 50%;
+      border-color: color-mix(in srgb, var(--ui-border-strong) 40%, transparent);
+      border-top-color: var(--ui-primary);
+      animation: pc-spin 0.7s linear infinite;
+    }
+    panel-captcha[state='verified'] .pc-indicator {
+      border-color: var(--ui-success);
+      background: var(--ui-success);
+    }
+    panel-captcha[state='verified'] .pc-indicator::after {
+      content: '';
+      display: block;
+      width: 5px;
+      height: 9px;
+      margin: 0 auto 2px;
+      border: solid var(--ui-success-foreground);
+      border-width: 0 2px 2px 0;
+      transform: rotate(45deg);
+    }
+    panel-captcha[state='verified'] .pc-label { color: var(--ui-success); }
+    panel-captcha[state='error'] .pc-indicator { border-color: var(--ui-destructive); }
+    panel-captcha[state='error'] .pc-label { color: var(--ui-destructive); }
+    @keyframes pc-spin { to { transform: rotate(360deg); } }
+  </style>
+  <!-- 多语言运行时（词典已在上面 head 的引导脚本里同步注入）：排在所有 css 之后，
+       且早于 body 末尾的 islands/ui.js 与 panel-captcha.js。 -->
+  <script src="i18n.js"></script>
+</head>
+<body>
+  <!-- 整页界面由 React 岛渲染（ui-islands/src/islands/login-page.tsx，随 islands/ui.js
+       一起加载；岛直接渲染卡片本身，不在这里写静态骨架）。
+       这个 <script> 必须排在 #login-app 之后、且不能加 defer/async：下面那段登录脚本
+       要同步拿到岛渲染出来的 #username / #password / #submit / #error / #mode-tip。 -->
+  <div id="login-app"></div>
+  <script src="islands/ui.js"></script>
+
+  <!-- 机器人校验组件（自定义元素定义，协议见 server::altcha 与文件头注释）。
+       必须排在下面那段内联脚本之前：脚本挂在元素上的 verified/expired 监听、
+       以及提交失败时的 reset() 都要求元素已经升级完成。 -->
+  <script src="panel-captcha.js"></script>
+  <script>
+    (function () {
+      'use strict';
+      var $ = function (id) { return document.getElementById(id); };
+      var tip = $('mode-tip');
+      var errorEl = $('error');
+      var button = $('submit');
+      var isSetup = false;
+
+      // ── 面板双令牌（agent2api.panelAuth，与 web_shim 的 PANEL_AUTH 段同键）──
+      // 「宿主中转」入口（fnOS docker 管理页这类面板跳板）会把 HttpOnly cookie
+      // 掐掉：登录 POST 能到、Set-Cookie 回不来，面板会话只能靠请求头。登录页
+      // 本身不走 web_shim，这里备一份同键的存取。
+      var PANEL_AUTH = 'agent2api.panelAuth';
+      function readPanelToken(kind) {
+        try {
+          var auth = JSON.parse(localStorage.getItem(PANEL_AUTH) || 'null');
+          var value = auth && auth[kind];
+          return typeof value === 'string' && value ? value : '';
+        } catch (e) { return ''; }
+      }
+      function storePanelTokens(access, refresh) {
+        try {
+          localStorage.setItem(PANEL_AUTH, JSON.stringify({ access: access, refresh: refresh }));
+        } catch (e) { /* 隐私模式等：存不了就只能依赖 cookie */ }
+      }
+
+      // ── 会话传输探测：cookie 在本环境能不能往返 ─────────────────
+      // fnOS docker 管理页这类宿主中转入口会把 Set-Cookie/Cookie 掐掉。
+      // 服务端种**两枚**探针 cookie（`/api/panel/cookie-probe` 连打
+      // 两发，第二发两枚都读得回 = roundtrip:true）。探测通过 → 纯 cookie
+      // 会话：登录请求不带任何标记，响应体没有令牌（与直连旧行为一致，
+      // JS 读不到任何令牌）；失败 → 登录请求带 x-panel-auth-mode: body，
+      // 令牌才进响应体，存 localStorage 走头部回退。探测测的是本环境的
+      // 真实传输，不猜代理行为 —— 哪天中转把 cookie 修好了会自动回归。
+      // 为什么必须是**两枚**：登录响应下发两条 Set-Cookie（access + refresh），
+      // 探针要和它同形才预测得了。单枚探针在那台中转上是**通过**的（值比对
+      // 对得上），登录却弹回 —— 它把两条拼成一条逗号分隔的，`Path=/` 因此
+      // 降级成一个名叫 `path` 的 cookie（回带名单里 path|domain|max-age|
+      // expires|session|version 那几项就是碎片），新会话没按 `/` 存进罐子。
+      var headerMode = false;
+      // 探针改**值比对**：cookie 按主机算、不分端口 —— 从 fnOS（:5666）中转
+      // 进来时，浏览器会把直连 :3065 时存下的**旧探针**一起带上；只判「有没
+      // 有」会被它骗成「通道完好」（实测弹回登录页）。所以第一发记住服务端
+      // 刚发的值，第二发用 ?expect= / ?expect-b= 让服务端比对 —— 旧探针的值
+      // 对不上才算不通。两发都用 POST：与登录同动词，防中转按方法区别对待 Set-Cookie。
+      var probeDone = fetch('/api/panel/cookie-probe?step=1', { method: 'POST', cache: 'no-store' })
+        .then(function (resp) { return resp.json(); })
+        .then(function (payload) {
+          var data = payload && payload.data;
+          var issued = data && data.token;
+          var issuedB = data && data.tokenB;
+          // 少一枚就按不通处理：服务端只发两枚，缺一枚说明响应被动过（或页面
+          // 是旧版缓存），这种环境下不敢把会话全押在 cookie 上
+          if (!issued || !issuedB) return { roundtrip: false };
+          return fetch('/api/panel/cookie-probe?step=2'
+            + '&expect=' + encodeURIComponent(issued)
+            + '&expect-b=' + encodeURIComponent(issuedB),
+            { method: 'POST', cache: 'no-store' }).then(function (resp) { return resp.json(); });
+        })
+        .then(function (payload) {
+          var data = payload && payload.data;
+          headerMode = !!(data && !data.roundtrip);
+        })
+        .catch(function () { headerMode = true; }); // 探测都发不出去：按中转处理，保登录可用
+
+      // 已登录（access 会话有效）→ 直接进面板；401 → 留在本页。
+      // 手里存有令牌就带上：中转环境 cookie 缺席，服务端靠这个头认会话。
+      (function () {
+        var headers = {};
+        var token = readPanelToken('access');
+        if (token) {
+          headers['x-panel-token'] = token;
+          // Authorization 是标准头：连自定义请求头都剥的中转也会放它过去
+          headers['Authorization'] = 'Bearer ' + token;
+        }
+        fetch('/api/session', { headers: headers }).then(function (resp) {
+          if (resp.ok) window.location.href = '/';
+        }).catch(function () { /* 未登录，留在本页 */ });
+      })();
+
+      // ── 机器人校验（proof-of-work，协议见 server::altcha）──
+      // 页面加载即领题求解（组件自己干）→ 绿勾「验证成功」，verified 事件给出
+      // 随提交的 payload。payload 一次性（服务器用后即焚）：提交失败要 reset()
+      // 重新验证。网关关闭了校验时领题回 400，整个组件隐藏，提交不带 payload。
+      var captchaPayload = null;
+      var captchaRequired = true; // 探测完成前先按「需要验证」保守处理
+      var widget = document.getElementById('captcha');
+
+      widget.addEventListener('verified', function (event) {
+        captchaPayload = (event.detail && event.detail.payload) || null;
+      });
+      widget.addEventListener('expired', function () {
+        captchaPayload = null;
+      });
+
+      // 探测开关：未启用时领题回 400，隐藏验证行（提交自然不带 payload）
+      fetch('/api/panel/captcha').then(function (resp) {
+        if (resp.ok) return;
+        captchaRequired = false;
+        widget.style.display = 'none';
+      }).catch(function () { /* 网关不可达：组件自会显示失败 */ });
+
+      // 决定模式：没有任何管理员 → 注册；否则登录
+      fetch('/api/panel/status').then(function (resp) { return resp.json(); }).then(function (data) {
+        var registered = data && data.data && data.data.registered;
+        isSetup = !registered;
+        tip.textContent = isSetup
+          ? '首次使用：创建一个管理员账号，用于登录此面板'
+          : '请输入管理员账号与密码';
+        $('submit').textContent = isSetup ? '创建账号并进入面板' : '登录';
+        if (isSetup) $('password').placeholder = '设置密码（至少 8 位）';
+      }).catch(function () {
+        tip.textContent = '无法连接网关，请确认服务已启动';
+      });
+
+      async function doSubmit(username, password) {
+        await probeDone; // 极端情况：提交赶在探测回来前，等它定完模式再发
+        button.disabled = true;
+        errorEl.textContent = '';
+        var body = { username: username, password: password };
+        if (captchaPayload) body.captcha = captchaPayload;
+        var headers = { 'Content-Type': 'application/json' };
+        // 标记走两条通道：自定义头 + URL 参数 —— 有的中转剥自定义请求头，
+        // query 剥不掉（登录请求能到服务器，query 就完整）
+        var markerUrl = headerMode ? '?auth-mode=body' : '';
+        if (headerMode) headers['x-panel-auth-mode'] = 'body';
+        fetch((isSetup ? '/api/panel/setup' : '/api/panel/login') + markerUrl, {
+          method: 'POST',
+          headers: headers,
+          body: JSON.stringify(body),
+        }).then(function (resp) {
+          return resp.json().then(function (payload) { return { ok: resp.ok, payload: payload }; });
+        }).then(function (result) {
+          if (result.ok) {
+            // 响应体里有没有令牌由服务端按我们的标记决定：中转模式才有。
+            // 有就先存进 localStorage 再跳面板（面板与登录页同源，读得到
+            // 同一份）；纯 cookie 模式下 body 里没有令牌，这里不落任何东西，
+            // 会话只存在于 HttpOnly cookie。
+            var data = result.payload && result.payload.data;
+            if (data && typeof data.accessToken === 'string' && data.accessToken
+              && typeof data.refreshToken === 'string' && data.refreshToken) {
+              storePanelTokens(data.accessToken, data.refreshToken);
+            }
+            window.location.href = '/';
+            return;
+          }
+          var detail = result.payload && (result.payload.error || result.payload);
+          // 后端的错误信封是 {success:false, error:"账号或密码不正确"}，error
+          // 是字符串；也兼容 {message:"…"} 形态的对象
+          if (detail && typeof detail === 'object') detail = detail.message;
+          errorEl.textContent = detail || '请求失败，请重试';
+          button.disabled = false;
+          captchaPayload = null; // payload 是一次性的：失败后重新验证
+          if (captchaRequired) widget.reset();
+        }).catch(function () {
+          errorEl.textContent = '无法连接网关';
+          button.disabled = false;
+          captchaPayload = null;
+          if (captchaRequired) widget.reset();
+        });
+      }
+
+      // capture：先于官方 widget 的 form 集成逻辑跑，未验证时给出明确提示
+      $('form').addEventListener('submit', function (event) {
+        event.preventDefault();
+        var username = $('username').value.trim();
+        var password = $('password').value;
+        if (!username || !password) {
+          errorEl.textContent = '请填写账号与密码';
+          return;
+        }
+        if (captchaRequired && !captchaPayload) {
+          errorEl.textContent = '请先勾选「我不是机器人」完成验证';
+          return;
+        }
+        doSubmit(username, password);
+      }, true);
+    })();
+  </script>
+</body>
+</html>

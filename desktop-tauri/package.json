@@ -1,0 +1,14 @@
+{
+  "name": "agent2api-desktop-tauri",
+  "version": "3.0.8",
+  "private": true,
+  "description": "Agent2API 桌面端 — 多提供商本地网关与会话管理（Tauri）",
+  "scripts": {
+    "dev": "tauri dev --config src-tauri/tauri.dev.conf.json",
+    "build": "tauri build",
+    "icon": "tauri icon src-tauri/icons/source.png"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

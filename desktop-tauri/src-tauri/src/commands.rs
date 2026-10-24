@@ -1,0 +1,1037 @@
+//! 暴露给渲染层的命令。
+//!
+//! 设计取向：命令层只做「HTTP 转发 + 输入整形」，不做业务校验 ——
+//! 与原 Electron 版一致（校验统一在后端 HTTP 层，避免同一套规则两处维护）。
+//! 前端把各功能映射成 `api_request(method, path, body)` 调用，
+//! 路径与入参整形集中在 bridge.js 里，便于对照排查。
+
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tauri::{AppHandle, Manager};
+use tauri_plugin_autostart::ManagerExt as AutostartExt;
+use tauri_plugin_dialog::DialogExt;
+
+use crate::backend;
+use crate::gateway;
+use crate::login::{self, LoginState};
+use crate::settings::{self, AppSettings};
+use crate::state::AppState;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiRequest {
+    pub method: String,
+    pub path: String,
+    #[serde(default)]
+    pub body: Option<Value>,
+}
+
+/// 统一的管理 API 入口：返回后端 data，出错时返回可读消息。
+#[tauri::command]
+pub async fn api_request(request: ApiRequest) -> Result<Value, String> {
+    gateway::call(&request.method, &request.path, request.body.as_ref()).await
+}
+
+/// 取原始文本（导出日志用）
+#[tauri::command]
+pub async fn api_request_text(method: String, path: String) -> Result<String, String> {
+    gateway::call_text(&method, &path).await
+}
+
+/// 后端就绪状态：渲染层可在启动阶段据此显示提示。
+///
+/// 返回的不只是「就绪与否」，还有**为什么没就绪** —— 端口冲突的详情
+/// （性质、占用者、能否靠结束进程解决）都在 `failure` 里。界面据此决定
+/// 是显示「网关启动中」还是给出「结束占用进程 / 更换端口」两个出口。
+///
+/// 之所以做成可反复查询而不是只发一次事件：事件可能在界面订阅之前就发出去了
+/// （窗口还在加载），那时用户只能看到一个灰着的状态灯，不知道发生了什么。
+#[tauri::command]
+pub async fn backend_status(app: AppHandle) -> Result<Value, String> {
+    let port = gateway::proxy_port();
+    let ready = backend::is_ready(port).await;
+    // 失败详情存在 AppState 里（由 ensure_ready 的失败分支写入）；
+    // 端口已被显式指定过（环境变量）时，界面不该再提供「更换端口」——
+    // 改设置也不会生效，只会让用户白忙一场
+    let failure = app
+        .state::<AppState>()
+        .backend
+        .lock()
+        .ok()
+        .and_then(|guard| guard.failure.clone());
+    Ok(json!({
+        "ready": ready,
+        "port": port,
+        "portFromEnv": gateway::port_from_env().is_some(),
+        "failure": failure,
+    }))
+}
+
+/// 重启整个应用。
+///
+/// ── 为什么是整进程重启，而不是「进程内重建后端」 ──────────────
+/// 服务端有一批**进程级单例**（模型目录、定时签到调度、更新管理器），它们用
+/// `OnceLock` 装载：第二次 `ServerState::bootstrap` 装不进全局，于是新的
+/// ServerState 会拿着一份与全局不同的句柄 —— 停机时 `stop_global()` 停的是
+/// 旧那份，新起的调度循环没人管。整进程重启让所有单例从头初始化，不存在这种
+/// 分叉；代价是窗口会重新打开（约一秒），换来的是「重启后状态一定是对的」。
+///
+/// ── 顺序上的两个要点 ────────────────────────────────────────
+///   1. **必须先 `begin_exit()`**：否则 `RunEvent::ExitRequested` 会被
+///      「关闭到托盘」那条规则拦下（`api.prevent_exit()`），重启请求落空；
+///   2. **延迟再退**：让本命令的返回值先回到前端，界面才能提示「正在重启」
+///      而不是无声消失。
+pub fn schedule_app_restart(app: &AppHandle) {
+    app.state::<AppState>().begin_exit();
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        // `restart()` 触发 ExitRequested → Exit（插件在此释放单实例互斥体）
+        // → 拉起新进程 → 本进程退出。不返回。
+        handle.restart();
+    });
+}
+
+/// 重启应用（供界面在「结束占用进程」后重试启动，或用户手动触发）。
+#[tauri::command]
+pub async fn restart_app(app: AppHandle) -> Result<Value, String> {
+    let port = gateway::proxy_port();
+    schedule_app_restart(&app);
+    Ok(json!({ "restarting": true, "port": port }))
+}
+
+/// 查占用网关端口的进程。
+///
+/// 端口没被占用（或查不到，例如系统保留段）时 `occupant` 为 null ——
+/// 界面据此只给「更换端口」，不显示一个点了必然失败的「结束进程」。
+#[tauri::command]
+pub async fn port_occupant() -> Result<Value, String> {
+    let port = gateway::proxy_port();
+    let occupant = backend::occupant_of(port);
+    Ok(json!({ "port": port, "occupant": occupant }))
+}
+
+/// 结束占用网关端口的进程，并在宽限期内确认端口真的释放。
+///
+/// 只结束 `port_occupant` 查到的那个 PID（不做按端口号的无差别清理：
+/// 端口在两次查询之间易主时，无差别清理会杀掉无辜进程）。
+/// 结束前由界面把进程名与路径显示给用户确认。
+///
+/// 成功后**不自动重启**：调用方（界面）需要先看到结果，再决定是否重启
+/// 让网关重新启动（`restart_app`）。
+#[tauri::command]
+pub async fn end_port_occupant(app: AppHandle) -> Result<Value, String> {
+    let port = gateway::proxy_port();
+    let Some(occupant) = backend::occupant_of(port) else {
+        return Err(format!(
+            "端口 {port} 上没有查到监听进程，无法结束。\
+             若该端口属于系统保留段，请改用「更换端口」。"
+        ));
+    };
+    // 结束是阻塞的（OpenProcess + TerminateProcess + 等端口释放），
+    // 放到阻塞线程池，别占着异步运行时的 worker
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let killed = backend::end_occupant(port, &occupant);
+        // 无论结束是否成功都探一次端口现状：成功了要确认释放，
+        // 失败了要告诉用户「现在端口上是什么情况」
+        let release = backend::wait_port_released(port);
+        (killed, release)
+    })
+    .await
+    .map_err(|error| format!("结束进程任务失败: {error}"))?;
+
+    let (killed, release) = result;
+    // 结束失败（权限不足 / 是系统进程 / 是本程序自己）原样把说明透给界面
+    killed.map_err(|conflict| conflict.message)?;
+    let released = release.is_ok();
+    if released {
+        // 端口已释放：**清掉启动失败记录**。那条记录描述的是「启动时端口被占」，
+        // 现在占用者已经不在了，留着会让界面一直显示「端口被占用」——
+        // 而用户刚结束完进程，看到这个只会以为没生效。
+        // 清掉后界面回到「网关启动中…」，如实反映「端口空着、网关还没起来」。
+        if let Ok(mut guard) = app.state::<AppState>().backend.lock() {
+            guard.failure = None;
+        }
+    }
+    Ok(json!({ "port": port, "released": released }))
+}
+
+/// 校验一个端口能否用于监听（「更换端口」在保存前先试）。
+///
+/// 用真实的 bind 探测，而不是查 netsh 保留段：实测保留段列表里有些端口
+/// 照样能绑上，列表既不充分也不必要（详见 port_conflict 模块头）。
+/// 返回 `{ ok, message, conflict }` —— 不抛错，因为「端口不可用」是
+/// 一种正常结果而非调用失败，界面要拿它的文案直接显示在输入框旁。
+#[tauri::command]
+pub async fn check_port(port: u16) -> Result<Value, String> {
+    if port == 0 {
+        return Ok(json!({ "ok": false, "message": "端口号必须在 1-65535 之间" }));
+    }
+    // 1024 以下的端口在 Windows 上通常需要管理员权限，直接拒绝能省掉
+    // 一次「保存成功但重启后起不来」的往返
+    if port < 1024 {
+        return Ok(json!({
+            "ok": false,
+            "message": "端口 1-1023 是系统保留范围，普通程序无法监听，请用 1024 以上的端口",
+        }));
+    }
+    let current = gateway::proxy_port();
+    if port == current {
+        return Ok(json!({ "ok": true, "message": "与当前端口相同，无需重启", "same": true }));
+    }
+    match crate::server::probe_port(port) {
+        Ok(()) => Ok(json!({ "ok": true, "message": format!("端口 {port} 可用") })),
+        Err(conflict) => Ok(json!({
+            "ok": false,
+            "message": conflict.message.clone(),
+            "conflict": conflict,
+        })),
+    }
+}
+
+/// 更换网关端口：校验 → 写设置 → 重启应用。
+///
+/// 校验放在写盘之前，是为了让「端口不可用」被拦在设置文件之外 —— 否则文件里
+/// 会留下一个起不来的端口，下次开机照样起不来。
+///
+/// 端口在服务端 bind 之后就改不了，所以必须重启（见 `schedule_app_restart`）。
+#[tauri::command]
+pub async fn change_port(app: AppHandle, port: u16) -> Result<Value, String> {
+    if port < 1024 {
+        return Err("端口 1-1023 是系统保留范围，请用 1024 以上的端口".to_string());
+    }
+    // 环境变量显式指定端口时，设置文件里的值不会生效 —— 与其静默失败，
+    // 不如明确告诉用户该改哪里
+    if gateway::port_from_env().is_some() {
+        return Err(
+            "当前端口由环境变量 AGENT2API_PROXY_PORT 指定，设置里的端口不会生效。\
+             请修改该环境变量后重启程序。"
+                .to_string(),
+        );
+    }
+    if port == gateway::proxy_port() {
+        return Ok(json!({ "changed": false, "port": port }));
+    }
+    // 真实 bind 探测：不可用就别写盘（详见 check_port 的说明）
+    if let Err(conflict) = crate::server::probe_port(port) {
+        return Err(conflict.message);
+    }
+
+    let mut current = settings::load();
+    current.proxy_port = port;
+    settings::save(&current)?;
+
+    // 重启后新端口生效。不在这里等结果：重启会带走本进程，
+    // 界面靠重连（页面重载）确认新端口是否可用。
+    schedule_app_restart(&app);
+    Ok(json!({ "changed": true, "port": port, "restarting": true }))
+}
+
+// ── 局域网访问（issue #48）────────────────────────────────────
+// 三条命令支撑设置页的「局域网访问」面板：查管理员注册状态、注册管理员、
+// 切换局域网访问。与其它壳命令「只做转发」的取向有一处刻意偏离：注册直接调
+// server 库（`access::setup_admin`）而不走 /api/panel/setup —— 那条 HTTP 路径
+// 服务 headless 的公开注册页，带着 ALTCHA 人机验证与公开竞争语义；桌面壳是
+// 本机受信进程，注册发生在**开启局域网监听之前**，两条路径的威胁模型不同。
+// 哈希格式由 `access::hash_password` 收口，两条入口产出互通的凭证。
+
+/// 查面板管理员是否已注册（设置页据此决定「开启局域网访问」要不要先走注册步）。
+#[tauri::command]
+pub fn panel_admin_status() -> Result<Value, String> {
+    Ok(json!({ "registered": crate::server::access::admin_registered() }))
+}
+
+/// 注册面板管理员（桌面壳的受信本地路径，见上组说明）。
+///
+/// 已有管理员时返回 `existed: true` 而不是报错：开启流程只关心「注册完有没有
+/// 管理员」，重复注册（两台设备同时走流程之类的竞态）不该让用户看到失败。
+#[tauri::command]
+pub async fn panel_register(username: String, password: String) -> Result<Value, String> {
+    let username = username.trim();
+    if username.is_empty() || username.chars().count() > 64 {
+        return Err("请填写管理员账号（64 字符以内）".to_string());
+    }
+    if password.len() < 8 {
+        return Err("密码至少 8 位".to_string());
+    }
+    let username = username.to_string();
+    // bcrypt 是刻意的慢函数，放阻塞线程池，别占异步 worker
+    let hash = tauri::async_runtime::spawn_blocking(move || {
+        crate::server::access::hash_password(&password)
+    })
+    .await
+    .map_err(|error| format!("注册任务失败: {error}"))??;
+
+    match crate::server::access::setup_admin(&username, &hash) {
+        Ok(true) => {
+            crate::server::logging::log(
+                "[Security]",
+                &format!("✅ 管理员「{username}」注册完成（桌面端）"),
+            );
+            Ok(json!({ "registered": true }))
+        }
+        Ok(false) => Ok(json!({ "registered": true, "existed": true })),
+        Err(reason) => Err(reason),
+    }
+}
+
+/// 切换局域网访问：校验 →（需要时补首把 Key）→ 写设置 → 重启应用。
+///
+/// ── 开启前必须有面板管理员 ──────────────────────────────────
+/// 监听一出回环，`/api/*` 的安全边界就是「管理员会话或 API Key」；没有管理员
+/// 时这个边界不存在（启动期的未注册闸门只兜异常态）。界面流程是「先注册、
+/// 后开启」，这里再挡一道防绕过。
+///
+/// ── 为什么在开启时补一把默认 Key ────────────────────────────
+/// 闸门与桌面壳自身的管理通道都建立在「至少一把启用的 Key」上：壳对管理 API
+/// 的请求靠自动携带第一把 Key 认证（`gateway::read_api_key`），一把启用的
+/// Key 都没有时，注册过管理员的世界里壳会被自己的闸门挡在外面（用户还没
+/// 来得及建 Key）。开启流程顺手补一把名为「默认」的 Key，并通过返回值告诉
+/// 界面去提示 —— 用户在「网关 Key」页能看到它。
+///
+/// 重启用 [`schedule_app_restart`]：监听地址在 bind 之后就改不了，
+/// 与 `change_port` 同一条铁律。
+#[tauri::command]
+pub fn change_lan_access(app: AppHandle, enabled: bool, panel: bool) -> Result<Value, String> {
+    if enabled && !crate::server::access::admin_registered() {
+        return Err("尚未注册面板管理员：请先完成注册再开启局域网访问".to_string());
+    }
+    // 面板托管只在局域网开启时有意义；关闭时一并归位
+    let panel = enabled && panel;
+
+    let mut created_key = None;
+    if enabled && crate::server::config::current().active_api_keys().is_empty() {
+        let entry = crate::server::core::api_keys::add("默认", None, Vec::new(), Vec::new())
+            .map_err(|message| format!("自动创建网关 Key 失败: {message}"))?;
+        crate::server::logging::log(
+            "[Config]",
+            &format!("✅ 已自动创建网关 Key「{}」（局域网访问开启流程）", entry.name),
+        );
+        created_key = Some(entry.public_json());
+    }
+
+    let mut current = settings::load();
+    current.lan_access = enabled;
+    current.lan_panel = panel;
+    settings::save(&current)?;
+
+    schedule_app_restart(&app);
+    Ok(json!({
+        "changed": true,
+        "enabled": enabled,
+        "panel": panel,
+        "restarting": true,
+        "createdKey": created_key,
+    }))
+}
+
+/// 界面直连网关时该带的凭证头（AI 助手的配置读写与流式对话）。
+///
+/// ── 为什么需要单独一条命令 ──────────────────────────────────
+/// 助手页为了流式对话/不受桥 60 秒超时限制，直接 fetch 网关基址（见
+/// ui-islands/src/islands/assistant-state.ts）。桌面形态下页面来自 Tauri
+/// 自定义协议、网关在 `127.0.0.1:{port}`：跨源 + 不带 cookie，请求里没有
+/// 任何凭证；面板认证一旦开启（设置页开过局域网访问就会注册管理员），
+/// `/api/*` 要求「面板会话或一把启用的 Key」，那条裸请求就会被 401
+/// `panel_login_required` 拒绝 —— 用户看到的就是「加载助手设置失败：请先
+/// 登录管理面板」，而桌面上并没有登录页。把壳自己用的那把 Key 交给页面，
+/// 直连通道与桥通道的凭证口径就一致了。
+///
+/// 返回 `{ 头名: 值 }`（桌面端只有 `x-api-key`）：网页端 shim 的同名方法回
+/// 面板令牌 / 用户输入的 Key，助手页对两端一视同仁，只负责合并。面板认证
+/// 没开启时多带一个头也不会被拒 —— 中间件的鉴权分支只在开启后才看它。
+#[tauri::command]
+pub fn direct_credentials() -> Result<Value, String> {
+    let mut headers = serde_json::Map::new();
+    if let Some(key) = crate::gateway::management_key() {
+        headers.insert("x-api-key".to_string(), Value::String(key));
+    }
+    Ok(Value::Object(headers))
+}
+
+/// 本机在局域网里的地址（给「局域网访问」面板显示 `http://<IP>:<端口>/v1` 用）。
+///
+/// UDP connect 不发任何包，只是让内核按路由表选出默认出口的源地址 —— 机器
+/// 有多块网卡时它就是「别人最可能访问到的那块」。拿不到（没有网络 / 只有
+/// 回环）返回 null：这不是调用失败，界面按「查不到地址」显示，不弹错误。
+#[tauri::command]
+pub fn local_ip() -> Result<Option<String>, String> {
+    let socket = match std::net::UdpSocket::bind("0.0.0.0:0") {
+        Ok(socket) => socket,
+        Err(_) => return Ok(None),
+    };
+    if socket.connect("8.8.8.8:80").is_err() {
+        return Ok(None);
+    }
+    Ok(socket
+        .local_addr()
+        .ok()
+        .map(|addr| addr.ip().to_string())
+        .filter(|ip| ip != "0.0.0.0" && ip != "127.0.0.1"))
+}
+
+/// 发起登录；阻塞到完成/失败/取消/超时。
+///
+/// `provider` 是 Option：老版本界面不会传它，缺省（None）按 workbuddy 处理 ——
+/// 那条链的行为必须逐字保持。`Option<String>` 在 Tauri 命令里就是「可以不传」，
+/// 比给一个空串默认值更贴实地表达「老客户端没有这个概念」。
+///
+/// `social_restore` 同样缺省为 false（不恢复 Google / GitHub 入口），
+/// 老界面不传它时得到的是与新界面默认不勾选一致的行为：登录窗口只按官方
+/// 登录页的形态走，不放宽域名白名单。
+///
+/// ── AutoClaw 国际版为什么不走这条命令 ────────────────────────
+/// 它的授权地址要先过一次**浏览器端**风控验证码（阿里云 SDK），而那个环境是
+/// 主窗口 —— 于是「拿地址」这一步在渲染层完成，壳只负责开窗口。因此它走
+/// [`start_autoclaw_oauth_login`]（入参是已经拿到的 state + authUrl），
+/// 不走这里。
+#[tauri::command]
+pub async fn start_login(
+    app: AppHandle,
+    edition: String,
+    mode: String,
+    provider: Option<String>,
+    social_restore: Option<bool>,
+) -> Result<Value, String> {
+    login::start(
+        &app,
+        edition,
+        mode,
+        provider.unwrap_or_default(),
+        social_restore.unwrap_or(false),
+    )
+    .await
+}
+
+/// AutoClaw 国际版 OAuth 登录：**授权地址已由前端拿好**，这里只开窗口并等待。
+///
+/// 入参 `state` 与 `authUrl` 来自 `POST /api/session/login/oauth/start`
+/// （前端跑完风控验证码之后调的那条）。理由见 `login::start_autoclaw_oauth`：
+/// 验证码只能在浏览器环境（主窗口）里跑，因此发起顺序与另外五家相反 ——
+/// 前端拿地址、壳开窗口，而不是壳回头问后端要地址。
+///
+/// `mode`：`embedded`（缺省，内嵌 WebView）或 `external`（系统浏览器）——
+/// 两者都可用，因为授权码由浏览器直接送到本机网关的 loopback 端口，
+/// 与浏览器在哪无关（与 CatPaw 同理）。
+#[tauri::command]
+pub async fn start_autoclaw_oauth_login(
+    app: AppHandle,
+    state: String,
+    auth_url: String,
+    mode: Option<String>,
+) -> Result<Value, String> {
+    login::start_autoclaw_oauth(
+        &app,
+        state,
+        auth_url,
+        &mode.unwrap_or_else(|| "embedded".to_string()),
+    )
+    .await
+}
+
+/// KukuAI 手机验证码登录 · 发码：开登录窗口（注入短信自动流程脚本）后立即返回。
+///
+/// 与其它短信链路（AutoClaw / Loomy）不同：百度通行证的「发码」必须在页面里
+/// 点（请求要带页面上生成的风控签名，见 `login::kuku_sms_script` 的说明），
+/// 所以这里**不是**调后端 API，而是让壳打开一个隐藏登录窗口替用户自动填号发码。
+/// 前端收到返回的 `state` 后进入「等验证码」状态，用户填码后走
+/// [`login_kuku_sms_verify`]。
+#[tauri::command]
+pub async fn login_kuku_sms_send(
+    app: AppHandle,
+    phone: String,
+) -> Result<Value, String> {
+    login::start_kuku_sms(&app, &phone).await
+}
+
+/// KukuAI 手机验证码登录 · 收码：把用户收到的验证码写入登录窗口，等登录完成。
+///
+/// 成功后返回 `{account, list}`（与 `POST /api/accounts` 添加账号的响应同形状，
+/// 前端直接走「已添加账号」收尾逻辑）。手机号在发码时已随窗口带进去，
+/// 这里只需要验证码。
+#[tauri::command]
+pub async fn login_kuku_sms_verify(
+    app: AppHandle,
+    code: String,
+) -> Result<Value, String> {
+    login::submit_kuku_sms_code(&app, &code).await
+}
+
+#[tauri::command]
+pub fn login_state(app: AppHandle) -> LoginState {
+    match login::current_login(&app) {
+        Some(active) => LoginState {
+            active: true,
+            mode: Some(active.mode),
+            edition: Some(active.edition),
+            provider: Some(active.provider),
+        },
+        None => LoginState { active: false, mode: None, edition: None, provider: None },
+    }
+}
+
+#[tauri::command]
+pub async fn cancel_login(app: AppHandle) -> Result<Value, String> {
+    login::cancel(&app).await?;
+    Ok(json!({ "canceled": true }))
+}
+
+/// 导出运行日志：拉取 JSONL 原文，弹系统保存框落盘。
+#[tauri::command]
+pub async fn export_logs(app: AppHandle) -> Result<Value, String> {
+    let text = gateway::call_text("GET", "/api/logs/download").await?;
+    let count = text.lines().filter(|line| !line.trim().is_empty()).count();
+    if count == 0 {
+        return Ok(json!({ "count": 0 }));
+    }
+
+    let stamp = timestamp_for_filename();
+    let default_name = format!("workbuddy-logs-{stamp}.jsonl");
+    let file = tauri_plugin_dialog::DialogExt::dialog(&app)
+        .file()
+        .set_title("导出运行日志")
+        .set_file_name(&default_name)
+        .add_filter("JSON Lines", &["jsonl"])
+        .add_filter("全部文件", &["*"])
+        .blocking_save_file();
+
+    let Some(target) = file else {
+        return Ok(json!({ "canceled": true, "count": count }));
+    };
+    let path = target
+        .into_path()
+        .map_err(|error| format!("保存路径无效: {error}"))?;
+    std::fs::write(&path, text.as_bytes()).map_err(|error| format!("写入日志文件失败: {error}"))?;
+    Ok(json!({ "count": count, "file": path.to_string_lossy() }))
+}
+
+/// 弹系统文件夹选择框，返回选中的绝对路径（取消 → `{canceled: true}`）。
+///
+/// 目前只有「下载内核」弹窗的「选择目录…」用它。**只负责选，不负责建**：
+/// 目标目录可以还不存在（用户也能在输入框里直接敲一个新路径），真正建目录是
+/// 下载开始时后端 `create_dir_all` 的事 —— 在这里建的话，「选了但最后没下载」
+/// 会平白留下一个空目录。
+///
+/// `defaultDir` 给对话框一个起点（通常是当前内核目录），不存在时忽略。
+#[tauri::command]
+pub async fn pick_folder(app: AppHandle, default_dir: Option<String>) -> Result<Value, String> {
+    let mut builder = tauri_plugin_dialog::DialogExt::dialog(&app)
+        .file()
+        .set_title("选择文件夹");
+    if let Some(dir) = default_dir.filter(|text| !text.trim().is_empty()) {
+        let path = std::path::PathBuf::from(dir);
+        if path.is_dir() {
+            builder = builder.set_directory(path);
+        }
+    }
+    let Some(folder) = builder.blocking_pick_folder() else {
+        return Ok(json!({ "canceled": true }));
+    };
+    let path = folder
+        .into_path()
+        .map_err(|error| format!("文件夹路径无效: {error}"))?;
+    Ok(json!({ "canceled": false, "path": path.to_string_lossy() }))
+}
+
+/// 读取应用设置。
+///
+/// `autostart` 以系统注册表的实际状态为准，而不是设置文件里的值：
+/// 用户可能在任务管理器的「启动」页里单独禁用了本应用，
+/// 那种情况下配置文件仍是 true，界面会显示成「已开启」，与实际不符。
+#[tauri::command]
+pub fn get_app_settings(app: AppHandle) -> AppSettings {
+    let mut current = settings::load();
+    if let Ok(enabled) = app.autolaunch().is_enabled() {
+        current.autostart = enabled;
+    }
+    // 顺手把缓存与磁盘对齐：拦截关窗时要用到最新值
+    app.state::<AppState>().window.set_close_to_tray(current.close_to_tray);
+    app.state::<AppState>().window.set_lightweight(current.lightweight_mode);
+    current
+}
+
+/// 覆盖保存应用设置，返回保存后的结果。
+///
+/// `autostart` 变化时同步系统自启动登记；返回值里的 `autostart` 取插件
+/// 反馈的实际结果，避免出现「界面显示已开启但注册表没写进去」。
+///
+/// ── 为什么 `proxyPort` 要从磁盘上带过来 ──────────────────────
+/// 本命令的调用方（设置页）只管「关闭到托盘」与「开机自启」两个开关，
+/// 它发来的 patch 里没有端口字段 —— 而本命令是**全量覆盖**写入。
+/// 若直接落盘，`proxyPort` 会被反序列化成 0（= 未设置），把用户通过
+/// 「更换端口」设过的端口悄悄抹掉，下次开机又回到 3065 上撞冲突。
+/// 端口不归这个命令管，就原样保留磁盘上的值。
+#[tauri::command]
+pub fn save_app_settings(app: AppHandle, patch: AppSettings) -> Result<AppSettings, String> {
+    let mut saved = patch;
+    // 端口由 change_port 专门负责，这里保持磁盘现值不被覆盖
+    saved.proxy_port = settings::load().proxy_port;
+
+    let autolaunch = app.autolaunch();
+    let currently_enabled = autolaunch.is_enabled().unwrap_or(false);
+    if saved.autostart != currently_enabled {
+        let result = if saved.autostart {
+            autolaunch.enable()
+        } else {
+            autolaunch.disable()
+        };
+        if let Err(error) = result {
+            return Err(format!("更新开机自启动失败: {error}"));
+        }
+        // 以系统实际状态回填：写注册表成功但被策略拦下时，这里能如实反映
+        saved.autostart = autolaunch.is_enabled().unwrap_or(saved.autostart);
+    }
+
+    settings::save(&saved)?;
+    // 立即生效：配置改完不用重启，下一次关窗就走新行为
+    app.state::<AppState>().window.set_close_to_tray(saved.close_to_tray);
+    app.state::<AppState>().window.set_lightweight(saved.lightweight_mode);
+    Ok(saved)
+}
+
+/// 导出账号：拉取导出数据，弹系统保存框落盘。
+///
+/// 账号与自定义提供商定义**都为 0** 时直接返回，不弹保存框 —— 让用户选完
+/// 路径再被告知「没东西可存」是纯打扰。只有定义没有账号（或反之）仍值得导：
+/// 导出文件现在同时承载两层（v2 起带 `customProviders` 段）。
+#[tauri::command]
+pub async fn export_accounts(app: AppHandle) -> Result<Value, String> {
+    let data = gateway::call("GET", "/api/accounts/export", None).await?;
+    let accounts = data
+        .get("accounts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let custom_providers = data
+        .get("customProviders")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if accounts.is_empty() && custom_providers.is_empty() {
+        return Ok(json!({ "count": 0 }));
+    }
+
+    let stamp = timestamp_for_filename();
+    let default_name = format!("workbuddy-accounts-{stamp}.json");
+    let file = app
+        .dialog()
+        .file()
+        .set_title("导出账号")
+        .set_file_name(&default_name)
+        .add_filter("JSON", &["json"])
+        .add_filter("全部文件", &["*"])
+        .blocking_save_file();
+
+    let Some(target) = file else {
+        return Ok(json!({ "canceled": true }));
+    };
+    let path = target
+        .into_path()
+        .map_err(|error| format!("保存路径无效: {error}"))?;
+    let text = serde_json::to_string_pretty(&data)
+        .map_err(|error| format!("导出内容序列化失败: {error}"))?;
+    std::fs::write(&path, text.as_bytes()).map_err(|error| format!("写入账号文件失败: {error}"))?;
+    Ok(json!({
+        "count": accounts.len(),
+        "customProviders": custom_providers.len(),
+        "file": path.to_string_lossy(),
+    }))
+}
+
+/// 从文件导入账号（merge 语义：按身份匹配，命中更新、未命中追加）。
+///
+/// 兼容两种形态：整体导出文件 `{ version, exportedAt, customProviders, accounts }`
+/// 与直接的账号数组 `[...]`。`customProviders` 段（v2 起的自定义提供商定义）
+/// 原样透传给后端 —— 账号的 provider 字段指向这些定义，丢了它们自定义账号
+/// 就导不回。
+#[tauri::command]
+pub async fn import_accounts(app: AppHandle) -> Result<Value, String> {
+    let file = app
+        .dialog()
+        .file()
+        .set_title("导入账号")
+        .add_filter("JSON", &["json"])
+        .add_filter("全部文件", &["*"])
+        .blocking_pick_file();
+
+    let Some(target) = file else {
+        return Ok(json!({ "canceled": true }));
+    };
+    let path = target
+        .into_path()
+        .map_err(|error| format!("文件路径无效: {error}"))?;
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("读取文件失败: {error}"))?;
+
+    let parsed: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("文件不是有效 JSON: {error}"))?;
+    let document = unwrap_envelope_file(parsed);
+    let accounts = match &document {
+        // 整体导出文件
+        Value::Object(map) => map
+            .get("accounts")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or("文件中缺少 accounts 字段")?,
+        // 直接就是账号数组
+        Value::Array(items) => items.clone(),
+        _ => return Err("文件内容既不是导出文件也不是账号数组".to_string()),
+    };
+
+    let mut payload = json!({ "accounts": accounts, "mode": "merge" });
+    if let Value::Object(map) = &document {
+        if let Some(definitions) = map.get("customProviders") {
+            payload["customProviders"] = definitions.clone();
+        }
+    }
+
+    gateway::call("POST", "/api/accounts/import", Some(&payload)).await
+}
+
+/// 网页端旧版「导出」把管理 API 的 `{ success, data }` 响应信封整个存成了
+/// 文件：顶层没有 accounts 而 data 里有时下钻一层，让旧文件不作废。
+/// 标准导出文件（顶层就是 accounts）与纯账号数组原样通过。
+fn unwrap_envelope_file(parsed: Value) -> Value {
+    let Value::Object(map) = &parsed else {
+        return parsed;
+    };
+    if map.contains_key("accounts") {
+        return parsed;
+    }
+    match map.get("data") {
+        Some(data) if data.get("accounts").is_some() => data.clone(),
+        _ => parsed,
+    }
+}
+
+/// 整库备份：弹系统保存框，后端把整库导出为 SQL 文本直接写到该路径。
+///
+/// 与账号导出（`export_accounts`）不同：**没有「空库不导」分支** —— 整库
+/// 语义下 kv 表至少有配置项，空库同样值得备份。文件内容不经壳中转，
+/// 后端按路径直写（几十 MB 的导出不占两份内存，见 `api/backup_api`）。
+#[tauri::command]
+pub async fn export_database(
+    app: AppHandle,
+    #[allow(non_snake_case)] includeLogs: Option<bool>,
+) -> Result<Value, String> {
+    let stamp = timestamp_for_filename();
+    let default_name = format!("agent2api-backup-{stamp}.sql");
+    let file = app
+        .dialog()
+        .file()
+        .set_title("整库备份")
+        .set_file_name(&default_name)
+        .add_filter("SQL", &["sql"])
+        .add_filter("全部文件", &["*"])
+        .blocking_save_file();
+    let Some(target) = file else {
+        return Ok(json!({ "canceled": true }));
+    };
+    let path = target
+        .into_path()
+        .map_err(|error| format!("保存路径无效: {error}"))?;
+    let payload = json!({
+        "filePath": path.to_string_lossy(),
+        // 前端不传（旧壳直调）时按完整导出
+        "includeLogs": includeLogs.unwrap_or(true),
+    });
+    let mut data = gateway::call("POST", "/api/backup/export", Some(&payload)).await?;
+    if let Value::Object(map) = &mut data {
+        map.insert("file".to_string(), Value::String(path.to_string_lossy().to_string()));
+    }
+    Ok(data)
+}
+
+/// 整库恢复：弹系统打开框，后端校验该 SQL 文件后整体替换数据库。
+///
+/// 覆盖前的确认弹窗由前端负责（文案里说明「本机数据会先自动备份到
+/// backups/ 目录」「恢复后需重新登录面板」）；这里只做选文件与转发。
+#[tauri::command]
+pub async fn import_database(app: AppHandle) -> Result<Value, String> {
+    let file = app
+        .dialog()
+        .file()
+        .set_title("整库恢复")
+        .add_filter("SQL", &["sql"])
+        .add_filter("全部文件", &["*"])
+        .blocking_pick_file();
+    let Some(target) = file else {
+        return Ok(json!({ "canceled": true }));
+    };
+    let path = target
+        .into_path()
+        .map_err(|error| format!("文件路径无效: {error}"))?;
+    let payload = json!({ "filePath": path.to_string_lossy() });
+    gateway::call("POST", "/api/backup/import", Some(&payload)).await
+}
+
+/// 检查新版本：把本应用版本作为 query 参数交给后端比较。
+///
+/// 版本号必须由壳提供 —— 后端以独立进程运行，不知道自己被哪个壳打包，
+/// 缺了它后端只能回报「最新版本是多少」，无法判断「是否有更新」。
+/// 取值用运行时的 package_info（打包配置里的版本），而不是编译期常量：
+/// 版本号在 Cargo.toml 与 tauri.conf.json 各有一份，前者可能与实际安装包不一致。
+#[tauri::command]
+pub async fn check_update(app: AppHandle) -> Result<Value, String> {
+    let current = app.package_info().version.to_string();
+    let path = format!("/api/update/check?current={}", urlencoding(&current));
+    gateway::call("GET", &path, None).await
+}
+
+/// 下载安装包（后端负责联网与落盘，这里只转发参数）
+#[tauri::command]
+pub async fn download_update(url: String, name: Option<String>) -> Result<Value, String> {
+    let payload = json!({ "url": url, "name": name.unwrap_or_default() });
+    gateway::call("POST", "/api/update/download", Some(&payload)).await
+}
+
+/// 下载进度（前端轮询）
+#[tauri::command]
+pub async fn update_progress() -> Result<Value, String> {
+    gateway::call("GET", "/api/update/progress", None).await
+}
+
+/// 取消下载
+#[tauri::command]
+pub async fn cancel_update() -> Result<Value, String> {
+    gateway::call("POST", "/api/update/cancel", Some(&json!({}))).await
+}
+
+/// 运行已下载的安装包。
+///
+/// 路径必须通过 `update::verify_installer` 的校验（存在、后缀属于本平台、
+/// 位于下载目录内），否则这个命令就成了「执行任意程序」的入口。
+///
+/// `restart` 为 true 时：先把退出标志置位再退出，让出安装包要覆盖的文件占用
+/// （不置位的话关窗逻辑会把退出拦成「最小化到托盘」，安装程序会卡在文件占用上）。
+///
+/// 顺序很关键：必须在启动安装包之前显式回收后端进程。
+/// 壳自己退出并不会带走 node 子进程（`exit(0)` 不保证触发 `RunEvent::Exit`），
+/// NSIS 覆盖安装时 node.exe 仍占着可执行文件与 3065 端口，复制文件必然失败；
+/// `backend::shutdown` 内部是同步的 kill + wait，返回时占用已经释放。
+///
+/// ── macOS 上为什么不退出（与 Windows 的关键差异）────────────────
+/// Windows 的 NSIS 是**覆盖安装**：安装程序要往正在运行的那个安装目录里写文件，
+/// 所以必须先把本进程与后端都让出来，否则复制文件必然失败。
+///
+/// macOS 的 dmg 是**挂载 + 拖拽**：`open` 只是把磁盘映像挂上，安装动作发生在
+/// 用户把 .app 拖进「应用程序」的那一刻，与当前正在运行的进程没有文件冲突。
+/// 此时若照着 Windows 那样退出，副作用反而更糟 —— 用户还没开始拖，
+/// 本机网关就已经停了（而且 dmg 挂载后用户往往会先去看一眼再决定），
+/// 等于用一个没有必要的退出打断了正在服务的网关。所以这一支不关机、不退出，
+/// 只把映像挂上，并如实把 `restart: false` 回给界面（界面据此不提示「即将退出」）。
+#[tauri::command]
+pub fn run_installer(app: AppHandle, path: String, restart: Option<bool>) -> Result<Value, String> {
+    let target = crate::update::verify_installer(&path)?;
+
+    // macOS：挂载磁盘映像即可，不回收后端、不退出（理由见函数说明）
+    #[cfg(target_os = "macos")]
+    {
+        // app 只被下面那一支用到；显式消费一次，避免 macOS 构建出现未使用告警
+        let _ = &app;
+        let _ = restart;
+        crate::update::launch_installer(&target, false)?;
+        return Ok(json!({
+            "launched": true,
+            "path": target.to_string_lossy(),
+            "restart": false,
+        }));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        // 先让出 node.exe 的文件占用与 3065 端口，再让安装包去覆盖文件
+        crate::backend::shutdown(&app.state::<AppState>());
+        crate::update::launch_installer(&target, true)?;
+
+        let restart = restart.unwrap_or(true);
+        if restart {
+            let state = app.state::<AppState>();
+            state.begin_exit();
+            // 稍留一点时间让命令的返回值先回到前端，再退出
+            let handle = app.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                handle.exit(0);
+            });
+        }
+        Ok(json!({
+            "launched": true,
+            "path": target.to_string_lossy(),
+            "restart": restart,
+        }))
+    }
+}
+
+/// 用系统默认浏览器打开 Release 页面。
+///
+/// 只允许 http(s)：直接交给系统打开器时，file:// 会变成「用默认程序打开本地文件」，
+/// 等于给渲染层留了一个执行本机文件的口子。
+///
+/// 打开动作复用 login.rs 的实现（Windows 走 ShellExecuteW）：本地原来的
+/// `cmd /C start` 会把 URL 里的 `&` 当命令分隔符，带查询串的链接会被截断，
+/// 而且控制台窗口会闪一下。
+#[tauri::command]
+pub fn open_release_page(url: String) -> Result<Value, String> {
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
+        return Err("只允许打开 http(s) 链接".to_string());
+    }
+    crate::login::open_in_browser(trimmed)?;
+    Ok(json!({ "url": trimmed }))
+}
+
+/// 设置主窗口主题（跟随界面深浅色切换）。
+///
+/// Windows 上这决定系统标题栏的深浅色（tao 内部走 DWMWA_USE_IMMERSIVE_DARK_MODE）：
+/// 不设置时标题栏由操作系统按「系统主题」绘制，于是界面切到深色时标题栏仍是浅色，
+/// 顶部就会出现一条刺眼的白带。传入 None 表示交回系统跟随，语义与 Tauri 一致。
+#[tauri::command]
+pub fn set_window_theme(app: AppHandle, theme: Option<String>) -> Result<(), String> {
+    let theme = match theme.as_deref() {
+        Some("dark") => Some(tauri::Theme::Dark),
+        Some("light") => Some(tauri::Theme::Light),
+        _ => None,
+    };
+    let window = app
+        .get_webview_window(crate::MAIN_WINDOW_LABEL)
+        .ok_or_else(|| "主窗口不存在".to_string())?;
+    window.set_theme(theme).map_err(|error| format!("设置窗口主题失败: {error}"))
+}
+
+/// 设置主窗口的界面缩放（浏览器缩放同款：整体缩放整页，含布局与字号）。
+///
+/// 因子走 Tauri 的 `set_zoom` —— Windows 上是 WebView2 的 ZoomFactor，语义与
+/// 用户按 Ctrl +/- 一致（不是 CSS zoom：那个只改布局，还会和 WebView 缩放叠加）。
+/// 界面上是「百分比下拉」（设置页「显示 → 界面缩放」，80%–130%、一档 5%），
+/// 这里再把关口收一遍：渲染层传来的值不信任 —— 非有限值拒绝、范围外直接报错
+/// （不静默夹取，免得界面显示 130% 而实际是别的值）。
+///
+/// 返回值是**实际生效的因子**（规整到两位小数），界面拿它回写显示。缩放的
+/// 持久化在前端 localStorage，壳这侧不记账（与窗口主题同一口径：壳只执行动作，
+/// 偏好由界面自己记）。
+#[tauri::command]
+pub fn set_zoom(app: AppHandle, scale: f64) -> Result<f64, String> {
+    const MIN: f64 = 0.8;
+    const MAX: f64 = 1.3;
+    if !scale.is_finite() {
+        return Err(format!("界面缩放值非法: {scale}"));
+    }
+    // 先规整再比范围：0.95 这类因子在浮点里是 0.9499999…，直接比大小会把 95% 误判出界
+    let factor = (scale * 100.0).round() / 100.0;
+    if !(MIN..=MAX).contains(&factor) {
+        return Err(format!("界面缩放需在 80%–130% 之间（收到 {:.0}%）", factor * 100.0));
+    }
+    let window = main_window(&app)?;
+    window
+        .set_zoom(factor)
+        .map_err(|error| format!("设置界面缩放失败: {error}"))?;
+    Ok(factor)
+}
+
+// ── 自定义标题栏的窗口三键 ─────────────────────────────────────
+// 主窗口已去掉系统装饰（见 lib.rs 建窗处的 `.decorations(false)`，参考
+// OmniProxy 的自定义标题栏），最小化 / 最大化 / 关闭改由界面自绘的标题栏
+// 承担。这四个命令是 `WebviewWindow` 同名方法的薄封装：界面经桥接层
+// （bridge.rs）调用，不直接感知 Tauri —— 与本文件其余命令同一取向。
+//
+// ── 关闭为什么可以直接给 window.close ─────────────────────────
+// 它触发的是 CloseRequested，与点系统标题栏的 ✕ 走**同一条事件路径**：
+// lib.rs 里「关闭到托盘」的拦截逻辑（prevent_close + hide）对两者一视同仁，
+// 关闭行为不因标题栏的引入而改变。
+//
+// 拖动与双击最大化不在这里：那是 `data-tauri-drag-region` 的内建行为
+// （Tauri 2 core 脚本监听 mousedown），前端只声明属性，无需命令参与。
+
+/// 最小化主窗口（标题栏「最小化」按钮）。
+#[tauri::command]
+pub fn window_minimize(app: AppHandle) -> Result<(), String> {
+    let window = main_window(&app)?;
+    window.minimize().map_err(|error| format!("最小化窗口失败: {error}"))
+}
+
+/// 切换主窗口最大化 / 还原（标题栏「最大化」按钮）。
+///
+/// Tauri 2.11 的 `WebviewWindow` 没有 toggle_maximize（那是 JS 侧 API 的名字），
+/// 壳侧只有 maximize / unmaximize / is_maximized —— 所以这里「先查再切」：
+/// 已最大化就还原，否则最大化。切换后的实际状态由界面再查
+/// [`window_is_maximized`] 获取（窗口尺寸变化也会触发它重查），命令本身
+/// 不返回状态 —— 让「图标显示什么」只有一份事实来源。
+#[tauri::command]
+pub fn window_toggle_maximize(app: AppHandle) -> Result<(), String> {
+    let window = main_window(&app)?;
+    let result = if window
+        .is_maximized()
+        .map_err(|error| format!("查询窗口状态失败: {error}"))?
+    {
+        window.unmaximize()
+    } else {
+        window.maximize()
+    };
+    result.map_err(|error| format!("切换窗口最大化失败: {error}"))
+}
+
+/// 关闭主窗口（标题栏 ✕）。
+///
+/// 与系统关闭按钮同语义：发出 CloseRequested，「关闭到托盘」开启时被
+/// lib.rs 拦成隐藏（托盘继续转发），否则正常退出 —— 注释理由见上组说明。
+#[tauri::command]
+pub fn window_close(app: AppHandle) -> Result<(), String> {
+    let window = main_window(&app)?;
+    window.close().map_err(|error| format!("关闭窗口失败: {error}"))
+}
+
+/// 查询主窗口是否处于最大化（标题栏据此切换最大化 / 还原图标）。
+///
+/// 界面在初始化时查一次，此后订阅 `tauri://resize`（见 bridge.rs 的
+/// onWindowResize）：最大化 / 还原 / 拖拽缩放都会改变窗口尺寸，每次
+/// 变化后重查一次即可让图标保持同步，不需要壳再发明一个专用事件。
+#[tauri::command]
+pub fn window_is_maximized(app: AppHandle) -> Result<bool, String> {
+    let window = main_window(&app)?;
+    window.is_maximized().map_err(|error| format!("查询窗口状态失败: {error}"))
+}
+
+/// 取主窗口句柄：四个窗口命令共用的一步查找（不存在时报可读错误）。
+fn main_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
+    app.get_webview_window(crate::MAIN_WINDOW_LABEL)
+        .ok_or_else(|| "主窗口不存在".to_string())
+}
+
+/// 最小化的 query 转义：版本号只含数字与点，做一层保险即可
+fn urlencoding(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => ch.to_string(),
+            other => format!("%{:02X}", other as u32 & 0xFF),
+        })
+        .collect()
+}
+
+/// 本地时间戳（yyyy-MM-dd-HH-mm-ss），避免引入时间格式化依赖
+fn timestamp_for_filename() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // 从 UTC 秒换算本地日期时间：这里只用于文件名，用 UTC+8 近似即可
+    let secs = now + 8 * 3600;
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let (hour, minute, second) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+
+    // civil_from_days：把 1970-01-01 起的天数换算成年月日
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+
+    format!("{year:04}-{month:02}-{day:02}-{hour:02}-{minute:02}-{second:02}")
+}
+

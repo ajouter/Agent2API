@@ -1,0 +1,35 @@
+# 依赖目录
+node_modules/
+
+# Tauri 工程依赖与构建产物
+desktop-tauri/node_modules/
+desktop-tauri/src-tauri/target/
+desktop-tauri/src-tauri/gen/schemas/
+
+# cargo 编译产物（src-tauri/.cargo/config.toml 把 target-dir 指到了项目根）
+/target/
+
+# 本地开发过程产物
+.zcode/
+.verify/
+prototype/
+# ZCode 的忽略配置文件本身（本机工具配置，不入库）
+.zcodeignore
+
+# 第三方参考项目（仅本地分析用）
+Acankao/
+desktop-tauri/web
+
+# 运行日志与截图产物
+logs/
+desktop-tauri/window-shot.png
+
+# 发布说明草稿只在本机留存，不入库；docs/ 下的其它文档正常入库
+/docs/release-notes/
+
+# 发版脚本下载的 CI 构建产物（scripts/release.sh）
+dist/
+
+# Docker 部署：密钥与运行数据不入库
+.env
+data/

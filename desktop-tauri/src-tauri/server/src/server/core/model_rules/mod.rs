@@ -1,0 +1,1360 @@
+//! 模型管理规则（config.json 的 `modelRules` 字段）：禁用 / 映射 / 自定义模型。
+//!
+//! 形状：
+//! ```json
+//! "modelRules": {
+//!   "disabled": [{ "provider": "catpaw", "id": "kimi-k3" }],
+//!   "mappings": [{ "alias": "gpt-4o", "target": "deepseek-v4-pro", "provider": "raccoon",
+//!                  "reasoning": "high" }],
+//!   "custom":   [{ "provider": "catpaw", "id": "kimi-k3-preview" }],
+//!   "seeded":   ["workbuddy:hy3"]
+//! }
+//! ```
+//! - **禁用**：模型在管理页里仍可见（开关关着），但不出现在 `/v1/models`，
+//!   请求它的**原始 id** 返回 404 model_not_found，这一家的**原生路由**也不再
+//!   进候选链（`catalog::builtin_target` 的第一个分支按 `default_enabled` 判定）。
+//!   **别名不受牵连**：映射条目只吃自己的 `enabled` 开关，目标模型被关不会挡住
+//!   别名 —— `manifest_for` 刻意保留被关掉的上游记录（理由见该函数的注释），
+//!   别名照旧解析得到它。所以「关掉主模型、用别名照样请求得到」是**预期行为**，
+//!   不是漏判；要让别名也失效，得关那条映射自己的开关（或删掉它）。
+//!   唯一例外是 `alias == target` 的自映射：它与模型的默认绑定共用一个开关
+//!   （`set_state` 同步两者），关模型即关它。
+//! - **映射**（照抄 OmniProxy 的模型映射语义）：把「上游模型（提供商 × 真名）」
+//!   以对外名 `alias` 暴露给下游。`alias` **自由命名**——允许与任何上游模型 id
+//!   同名（同名时该上游的原生路由仍在、且优先，映射是追加的兜底路，不存在遮蔽）；
+//!   **同一 alias 可以有多条映射**（不同提供商各一条）——下游用同一个名字请求，
+//!   路由在「原生承载家 + 各映射提供商」之间按账号全局优先级主备切换。
+//!   候选链的展开与发送名的按家改写见 `providers::router` 与
+//!   `catalog::wire_target_for_provider`。每条映射自带一个**开关**
+//!   （`enabled`，缺省 true）：关掉 = 这条别名暂时不存在（不广告、不路由、
+//!   不改写发送名），管理页里可再打开 —— 与模型的启停开关同一哲学。
+//!
+//! ── 历史的 `hidden` 机制已移除（一次性清理语义）──────────────
+//! 旧版有一个 `hidden` 列表（管理页「删除」按钮背后的东西）：从清单里拿掉、
+//! 可在「已删除」筛选里恢复。它已被**每行一个启用开关 + 每条映射一个开关**
+//! 取代（参考 OmniProxy 的模型管理）。现在的处理是：
+//! `from_raw` **不再读取** `hidden` 键，`to_value` 也不再写出它 ——
+//! 于是残留的隐藏名单既不会拦请求、也不会进广告，用户下次做任意一次写操作
+//! （启停 / 加删映射 / 种子落盘）时，整份替换会把它从 config.json 里自然抹掉。
+//! 这是「功能已移除」该有的行为：数据随下一次写自然蒸发，不做专门的迁移。
+//!
+//! ── 映射条目的 provider 字段 ────────────────────────────────
+//! 新条目都带 `provider`（target 所属的家，UI 从该家的模型行上创建）。
+//! 旧版条目（升级前）没有 provider：语义是「alias 改写成 target，由所有承载
+//! target 的家接收」——路由扩池时对 provider 缺失的条目取 `providers_for_model(target)`，
+//! 发送名同样改成 target，行为与升级前逐字等价（旧校验保证 alias 不与上游 id
+//! 同名，所以「原生承载 alias 的家」为空，不存在语义分叉）。
+//!
+//! ── 启停粒度是「提供商 × 模型 id」，不再是全局 id ─────────────
+//! 同一个模型 id（或对外名）常被多家同时提供（如 `kimi-k3`：CatPaw 的上游 id
+//! 与小浣熊经去前缀映射暴露的对外名同名）。规则按 `(provider, id)` 存放，
+//! 关掉某一家只是这一家不再接收该模型的请求，别家照常。
+//!
+//! ── 历史条目的兼容（不要「顺手迁移」）─────────────────────────
+//! 旧版把 disabled / hidden 存成**纯 id 字符串数组**（全局生效）。读取时兼容：
+//! 字符串条目解析成 `provider: None`，对**任何提供商**都命中 —— 升级后用户
+//! 之前做的全局启停保持原样，直到他在管理页里对某一家重新启停（那时写侧会
+//! 按「展开为其余各家」的语义把它替换掉，见 `set_state`）。
+//!
+//! - **seeded**：已经做过「默认规则种子」的 (provider, id)，写成
+//!   `"provider:id"` 字符串（旧版是纯 id，读取时对任何 provider 都算已种 ——
+//!   只影响「要不要再种一次默认值」，保守方向是正确的）。
+//!   种子只在模型**首次出现**时生效一次：之后用户在管理页的手动调整
+//!   （重新启用、删除映射）不会被下一次清单刷新悄悄改回去。
+//!
+//! ── 自定义模型（`custom`）────────────────────────────────────
+//! 用户在管理页手动登记「这家还有这个上游模型」。它解决的是一个具体的死角：
+//! 上游目录接口没广告、但实际能路由的模型（灰度中的新模型、按账号下发但没进
+//! 目录的模型），此前网关既列不出、也调不通。
+//!
+//! 这些条目**不是**禁用那种「规则」——它们是**清单的补充来源**：
+//! `providers::catalog::manifest_for` 把该家的自定义条目拼在自己的清单后面，
+//! 于是能力判定、路由候选链、`/v1/models`、管理页、入口校验**一次全通**。
+//! 因此「删除自定义模型」是从本数组里**移除**：用户要的是
+//! 「这个模型我登记错了，删掉」，语义上不存在「恢复」这一步。
+//!
+//! 登记条目**不编造能力位**：用户登记时并不知道真实值，给一个默认值等于让
+//! `/v1/models` 对下游**撒谎**（例如声明支持图片实际不支持）。缺字段的后果
+//! 只是 `list_item` 里少几个元数据键（与图像模型同款行为），下游据此保守
+//! 处理 —— 比给错值好。
+//!
+//! ── 能力位覆盖（`capabilities`）──────────────────────────────
+//! 但**上游给的值本身也可能是错的**：远程目录撒谎、静态表跟不上上游调整时，
+//! 下游拿到错的能力就会按错的形状构造请求（给不支持的模型发图片、按虚高的
+//! 窗口堆历史），而以前纠正它的唯一手段是改代码。`capabilities` 就是那层
+//! 纠正 —— 按 `(provider, id)` 存一组对下游出口的覆盖值，
+//! `providers::catalog::manifest_for` 在清单成型处统一应用，于是 `/v1/models`
+//! （含 Anthropic 列表视图）与管理页一次全通。键名与归一规则在
+//! `core::capability`：内置家的覆盖存本模块，自定义家存在提供商记录的
+//! `models[].capabilities` 里，**两份存储共用同一套判定**。
+//!
+//! 与其它列表的语义差别：`capabilities` 是**纯出口元数据**，网关内部不读这
+//! 几个键做任何决策（路由 / 启停 / 转发都与它无关），所以它不影响
+//! `disabled` / `mappings` / `custom` 的任何行为。
+//!
+//! 所有比对忽略大小写（与 `catalog::providers_for_model` 同口径）。
+//!
+//! ── 思考等级绑定（`mappings[].reasoning`）─────────────────────
+//! 每条映射可以额外带一个思考等级（None / 空 = 不覆盖）。**这段机制、各家的
+//! 翻译规则、以及「哪些情况故意不注入」都在 `reasoning.rs`** —— 那里有候选表、
+//! 归一规则，以及「等级怎么进到转发链路」的完整说明（动手改这个字段前务必先读
+//! 那一段）。这里只留结论：字段挂在映射条目上（与本模块的映射同生共死），
+//! `ModelRules::from_raw` / `Mapping::to_value` 负责它的读写容错；
+//! **转发侧**在 `upstream::payload::send_body` 按家改写模型名的那一步一并解析、
+//! 交给该家适配器翻译（见 `providers::catalog::wire_target_for_provider`）。
+
+use serde_json::{json, Map, Value};
+
+use crate::server::config;
+
+pub const KEY_MODEL_RULES: &str = "modelRules";
+
+/// Cline 专用的规则件：默认映射种子 + 拆分迁移 + 池前缀工具。
+///
+/// 拆出去的理由见那个文件的模块头（一次性迁移与长期机制不该混在一起，
+/// 以及单文件体量约定）。`pub use` 让调用方仍写 `model_rules::seed_cline_defaults`
+/// 这类路径，不必知道它住在子模块里。
+mod cline;
+
+pub use cline::{migrate_cline_split, seed_cline_defaults};
+
+/// WorkBuddy 专用的规则件：默认启用白名单种子 + **拆家迁移**。
+///
+/// 与 `cline` 同一模式（那家是拆池、本家是拆地区，两次迁移的形态也接近）：
+/// 拆出去的理由见那个文件的模块头（拆家迁移与长期机制不该混在一起，
+/// 以及单文件体量约定）。`pub use` 让调用方仍写
+/// `model_rules::seed_workbuddy_defaults` / `model_rules::migrate_workbuddy_split`。
+mod workbuddy;
+
+pub use workbuddy::{
+    migrate_workbuddy_split, seed_workbuddy_defaults, SplitMigrationOutcome,
+    WORKBUDDY_DEFAULT_ENABLED,
+};
+
+/// 思考等级组件（候选表 + 归一规则 + 设计取舍说明）。
+///
+/// 与 `cline` 同一模式：拆出去的理由见那个文件的模块头（长期机制与
+/// 「这一段为什么这么做」的大段说明不该与规则机制本身挤在一个文件里，
+/// 以及单文件体量约定）。`pub use` 让调用方仍写
+/// `model_rules::REASONING_LEVELS` / `model_rules::normalize_reasoning`
+/// 这类路径，不必知道它住在子模块里。
+mod reasoning;
+
+pub use reasoning::{
+    effort_rank as reasoning_rank, is_thinking_off as reasoning_is_off,
+    normalize as normalize_reasoning, read_client_level, REASONING_LEVELS,
+};
+
+/// 一条映射：把上游模型（`provider` × `target`）以对外名 `alias` 暴露给下游。
+///
+/// `provider` 指明 target 所属的家（新条目总是带；旧版条目为 `None`，
+/// 语义是「所有承载 target 的家」，读取兼容见模块头）。同一 `alias` 允许
+/// 多条（不同提供商各一条），路由时一起进入候选链主备切换。
+///
+/// `reasoning` 是这条映射上的**思考等级绑定**（`None` = 不覆盖）。
+/// 转发侧在按家改写模型名的同一步解析它（`catalog::wire_target_for_provider`），
+/// 交给该家适配器翻译成本家上游认识的档位字段 —— 各家的规则与「故意不注入」
+/// 的几种情形见 `reasoning.rs` 的模块头。
+///
+/// `enabled` 是这条映射自己的开关（参考 OmniProxy 的模型管理）：**false = 这条
+/// 别名暂时不存在** —— 不进 `/v1/models` 广告、不参与路由候选链展开、不做发送名
+/// 改写，但管理页里仍看得到、可再打开。与模型行的启停开关同一哲学：
+/// 「关掉」是可逆的暂态，「删除」（`remove_mapping`）才是不可逆的。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mapping {
+    pub alias: String,
+    pub target: String,
+    pub provider: Option<String>,
+    pub reasoning: Option<String>,
+    pub enabled: bool,
+}
+
+/// 一条启停规则的键：`(provider, id)`。
+///
+/// `provider` 为 `None` 的条目来自旧版配置（纯 id 字符串），语义是
+/// 「对所有提供商生效」；新版写侧永远带 provider。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuleEntry {
+    pub provider: Option<String>,
+    pub id: String,
+}
+
+impl RuleEntry {
+    fn new(provider: Option<&str>, id: &str) -> Self {
+        Self { provider: provider.map(str::to_string), id: id.to_string() }
+    }
+
+    fn to_value(&self) -> Value {
+        match &self.provider {
+            Some(provider) => json!({ "provider": provider, "id": self.id }),
+            None => Value::String(self.id.clone()),
+        }
+    }
+
+    /// 条目是否命中 `(provider, id)`：id 同（忽略大小写），且 provider 为
+    /// None（全局条目）或与目标一致。
+    fn matches(&self, provider: &str, id: &str) -> bool {
+        self.id.eq_ignore_ascii_case(id)
+            && self.provider.as_deref().map_or(true, |p| p.eq_ignore_ascii_case(provider))
+    }
+}
+
+/// 一条**自定义模型**：用户手动登记「这家还有这个上游模型」。
+///
+/// 与 [`RuleEntry`] 的区别值得强调：`RuleEntry` 是**规则**（对清单里已有的
+/// 条目做启停），本结构是**清单的补充**（往清单里加一个原本没有的条目）。
+/// 两者的 `provider` 都是必填 —— 规则那边的 None 是旧版全局语义的兼容形态，
+/// 这里没有历史包袱，缺 provider 的条目在读取时直接丢弃（见 `from_raw`）。
+///
+/// 字段只有两个：模型 id 与它所属的家。**展示名不单独存** —— 用户填的就是
+/// 上游 id，再让他编一个显示名只会多一处要维护的事实；清单里的 `name` 由
+/// [`custom_models_for`] 用 id 顶替（下游看到的名称与请求名一致，不会混淆）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomModel {
+    pub provider: String,
+    pub id: String,
+}
+
+impl CustomModel {
+    fn to_value(&self) -> Value {
+        json!({ "provider": self.provider, "id": self.id })
+    }
+
+    /// 是否命中 `(provider, id)`（都忽略大小写）。
+    ///
+    /// `pub`：管理页判「来源 = 手动」时要在 `catalog` 侧按同一口径比对
+    /// （见 `catalog::manage_entries`）—— 在那里另写一遍忽略大小写的比较，
+    /// 迟早会与这里的口径分叉。
+    pub fn matches(&self, provider: &str, id: &str) -> bool {
+        self.provider.eq_ignore_ascii_case(provider) && self.id.eq_ignore_ascii_case(id)
+    }
+}
+
+/// 一条能力位覆盖：`(provider, id)` 的模型对下游声明的能力位（见模块头的
+/// 「能力位覆盖」）。
+///
+/// `values` 是**稀疏表**：只存被覆盖的键（键名与归一规则在
+/// `core::capability`），没被覆盖的键沿用清单原值。空表不存在 —— 写侧
+/// （[`set_capabilities`]）会把清空的条目整条移除，读取侧也丢弃空条目。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityOverride {
+    pub provider: String,
+    pub id: String,
+    pub values: Map<String, Value>,
+}
+
+impl CapabilityOverride {
+    /// 是否命中 `(provider, id)`（都忽略大小写，与 `CustomModel::matches` 同口径）。
+    ///
+    /// `pub`：管理视图（`catalog::manage_view`）要按同一口径在快照里查
+    /// 「这条模型被覆盖了哪几项」—— 在那里另写一遍比较，迟早会与这里分叉。
+    pub fn matches(&self, provider: &str, id: &str) -> bool {
+        self.provider.eq_ignore_ascii_case(provider) && self.id.eq_ignore_ascii_case(id)
+    }
+
+    /// 落盘的 JSON 形态：`{provider, id, …各能力键}` —— 能力值**平铺**在条目
+    /// 上（不再套一层 `values` 对象）：手改 config.json 时一眼能看出这条覆盖
+    /// 了哪几项，而多一层嵌套只会让排查多一次展开。
+    fn to_value(&self) -> Value {
+        let mut object = Map::new();
+        object.insert("provider".to_string(), Value::String(self.provider.clone()));
+        object.insert("id".to_string(), Value::String(self.id.clone()));
+        for (key, value) in &self.values {
+            object.insert(key.clone(), value.clone());
+        }
+        Value::Object(object)
+    }
+}
+
+impl Mapping {
+    /// 落盘的 JSON 形态。
+    ///
+    /// `reasoning` 为 `None` 时**仍然写出 `null`**，与 `provider` 的写法同一
+    /// 口径（`json!` 对 `Option::None` 给 `null`）：形状稳定比省几个字节重要，
+    /// 且读取侧的容错本来就认 `null`（`as_str` 拿到 None）。反过来**不**在
+    /// `None` 时省略这个键 —— 那样配置里同一个字段时有时无，排查时更难读。
+    ///
+    /// `enabled` 与此**刻意相反**：只在 false 时写出 `enabled: false`，
+    /// true 一律省略 —— true 是缺省语义（读取侧缺键视为 true），历史条目
+    /// （没有这个键的）因此在写回时一个字节都不多，配置文件不被无谓扰动。
+    fn to_value(&self) -> Value {
+        let mut object = json!({
+            "alias": self.alias,
+            "target": self.target,
+            "provider": self.provider,
+            "reasoning": self.reasoning,
+        });
+        if !self.enabled {
+            if let Some(map) = object.as_object_mut() {
+                map.insert("enabled".to_string(), Value::Bool(false));
+            }
+        }
+        object
+    }
+}
+
+/// 解析后的规则快照
+#[derive(Clone, Debug, Default)]
+pub struct ModelRules {
+    pub disabled: Vec<RuleEntry>,
+    pub mappings: Vec<Mapping>,
+    /// 用户手动登记的上游模型（清单的补充来源，见模块头）
+    pub custom: Vec<CustomModel>,
+    /// 能力位覆盖（对下游出口的纠正，见模块头的「能力位覆盖」）
+    pub capabilities: Vec<CapabilityOverride>,
+    pub seeded: Vec<String>,
+}
+
+/// 从规则数组的 JSON 形态还原条目列表（兼容旧版纯 id 字符串）
+fn entries_from(value: Option<&Value>) -> Vec<RuleEntry> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| match item {
+                    // 旧形态：纯 id 字符串 = 全局规则
+                    Value::String(id) => {
+                        let id = id.trim();
+                        if id.is_empty() {
+                            None
+                        } else {
+                            Some(RuleEntry::new(None, id))
+                        }
+                    }
+                    // 新形态：{provider, id}
+                    Value::Object(object) => {
+                        let id = object.get("id").and_then(Value::as_str).map(str::trim).unwrap_or("");
+                        if id.is_empty() {
+                            return None;
+                        }
+                        let provider = object
+                            .get("provider")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|provider| !provider.is_empty());
+                        Some(RuleEntry::new(provider, id))
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 从 JSON 数组还原自定义模型列表。
+///
+/// 容错口径比 `entries_from` **更严**：那里字符串条目有「旧版全局规则」的
+/// 合法含义，这里的 `provider` 是**必填**（没有 provider 就不知道该把条目
+/// 拼进哪一家的清单，等于一条永远不生效的死数据）。因此缺 provider / 缺 id /
+/// 非对象形态的条目一律丢弃 —— 静默留一条不生效的记录，比丢掉它更难排查。
+fn custom_from(value: Option<&Value>) -> Vec<CustomModel> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let object = item.as_object()?;
+                    let id = object
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or("");
+                    let provider = object
+                        .get("provider")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or("");
+                    if id.is_empty() || provider.is_empty() {
+                        return None;
+                    }
+                    Some(CustomModel {
+                        provider: provider.to_string(),
+                        id: id.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 从 JSON 数组还原能力覆盖列表（值走 `core::capability` 的归一）。
+///
+/// 容错口径与 `custom_from` 同一条：`provider` / `id` 必填 —— 少了就不知道
+/// 该覆盖哪一家的哪条模型，等于一条永不生效的死数据。非法能力键 / 非法值
+/// 在归一里被丢弃；**归一后为空的条目也丢弃**（它等价于「没有覆盖」，留着
+/// 只会让管理页的「已改」标记与 `capOverrides` 多列几个并不生效的键）。
+fn capabilities_from(value: Option<&Value>) -> Vec<CapabilityOverride> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let object = item.as_object()?;
+                    let id = object.get("id").and_then(Value::as_str).map(str::trim).unwrap_or("");
+                    let provider = object
+                        .get("provider")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or("");
+                    if id.is_empty() || provider.is_empty() {
+                        return None;
+                    }
+                    let values = crate::server::core::capability::normalize_object(Some(item));
+                    if values.is_empty() {
+                        return None;
+                    }
+                    Some(CapabilityOverride {
+                        provider: provider.to_string(),
+                        id: id.to_string(),
+                        values,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+impl ModelRules {
+    pub fn from_raw(raw: &Map<String, Value>) -> Self {
+        let Some(object) = raw.get(KEY_MODEL_RULES).and_then(Value::as_object) else {
+            return Self::default();
+        };
+        let mappings = object
+            .get("mappings")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let alias = item.get("alias")?.as_str()?.trim();
+                        let target = item.get("target")?.as_str()?.trim();
+                        if alias.is_empty() || target.is_empty() {
+                            return None;
+                        }
+                        let provider = item
+                            .get("provider")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|provider| !provider.is_empty());
+                        // 思考等级：**缺失 / 非字符串 / 空串一律 None（不覆盖）**。
+                        // 旧数据（升级前写下的映射）没有这个键，这条容错就是
+                        // 「升级不能让已有映射变样」的实现方式：读出来与写回去
+                        // 都不带 `reasoning` 的条目，行为与升级前逐字相同。
+                        let reasoning = item
+                            .get("reasoning")
+                            .and_then(Value::as_str)
+                            .and_then(normalize_reasoning);
+                        // 映射开关：**缺失 / 非 bool 一律 true**。历史条目（开关
+                        // 功能上线前写下的映射）没有这个键，这条容错就是
+                        // 「升级不能让已有映射变样」的实现方式 —— 读出来是
+                        // enabled，而写回时 true 不落键（见 `Mapping::to_value`），
+                        // 历史配置在升级前后逐字相同。
+                        let enabled = item.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+                        Some(Mapping {
+                            alias: alias.to_string(),
+                            target: target.to_string(),
+                            provider: provider.map(str::to_string),
+                            reasoning,
+                            enabled,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            disabled: entries_from(object.get("disabled")),
+            // `hidden` 键**不再读取**（机制已移除，见模块头的「一次性清理语义」）：
+            // 残留的隐藏名单在这里被丢弃，既不拦请求也不进广告；下次任意写操作
+            // 落盘时整份替换会把它从 config.json 里自然抹掉。
+            mappings,
+            custom: custom_from(object.get("custom")),
+            capabilities: capabilities_from(object.get("capabilities")),
+            seeded: object
+                .get("seeded")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    fn to_value(&self) -> Value {
+        json!({
+            "disabled": self.disabled.iter().map(RuleEntry::to_value).collect::<Vec<_>>(),
+            // `hidden` 不再写出（机制已移除，见模块头）：整份替换落盘时，
+            // 配置里残留的 hidden 名单就此消失 —— 一次性清理的实现方式。
+            "mappings": self.mappings.iter().map(Mapping::to_value).collect::<Vec<_>>(),
+            // `custom` 必须在这里写出：本函数是**整份替换**（`save` → 
+            // `config::update_raw_field`），漏掉哪个键，任何一次写规则
+            // （启停 / 加映射 / 删映射 / 四个种子）都会把那个键的数据整份抹掉。
+            "custom": self.custom.iter().map(CustomModel::to_value).collect::<Vec<_>>(),
+            // 与 `custom` 同一条硬约束：本函数是整份替换，漏写出哪个键，
+            // 任何一次写规则都会把那个键的数据整份抹掉。
+            "capabilities": self.capabilities.iter().map(CapabilityOverride::to_value).collect::<Vec<_>>(),
+            "seeded": self.seeded,
+        })
+    }
+
+    /// 单条列表（disabled）上「按 id 取条目」的匹配判定
+    fn hit(list: &[RuleEntry], provider: &str, id: &str) -> bool {
+        list.iter().any(|entry| entry.matches(provider, id))
+    }
+
+    pub fn is_disabled(&self, provider: &str, id: &str) -> bool {
+        Self::hit(&self.disabled, provider, id)
+    }
+
+    /// 精确提供商规则覆盖旧版全局规则，包括显式关闭的条目。
+    pub fn binding(&self, provider: &str, alias: &str, target: &str) -> Option<&Mapping> {
+        let matches = |m: &&Mapping| {
+            m.alias.eq_ignore_ascii_case(alias) && m.target.eq_ignore_ascii_case(target)
+        };
+        self.mappings.iter().filter(matches)
+            .find(|m| m.provider.as_deref().is_some_and(|owner| owner.eq_ignore_ascii_case(provider)))
+            .or_else(|| self.mappings.iter().filter(matches).find(|m| m.provider.is_none()))
+    }
+
+    /// disabled 只控制原始 ID 的默认绑定，不能连带关闭其他别名。
+    pub fn default_enabled(&self, provider: &str, id: &str) -> bool {
+        !self.is_disabled(provider, id)
+            && self.binding(provider, id, id).map_or(true, |mapping| mapping.enabled)
+    }
+
+    pub fn is_blocked(&self, provider: &str, id: &str) -> bool {
+        !self.default_enabled(provider, id)
+    }
+
+    /// 某对外名的**生效**映射条目（同名多条 = 多提供商主备；顺序 = 配置顺序）。
+    ///
+    /// **只返回 `enabled` 的条目**：关闭的映射在语义上就是「这条别名不存在」，
+    /// 不该出现在任何转发侧视图里。转发侧各消费点的过滤口径同源 ——
+    /// `catalog::builtin_target` 与 `wire_target_for_provider` 经 `binding()`
+    /// 判每条绑定的启停、`catalog::model_blocked_everywhere` 用本函数
+    /// 区分「未知模型 vs 全被关闭」、`provider_loop` 的「含映射」日志提示
+    /// 用它决定要不要缀那句话。管理页要看见**全量**（含关闭的，才能再打开），
+    /// 它直接遍历 `rules.mappings`（见 `catalog::manage_view`），不走本函数。
+    pub fn mappings_of(&self, model: &str) -> Vec<&Mapping> {
+        self.mappings
+            .iter()
+            .filter(|m| m.enabled && m.alias.eq_ignore_ascii_case(model))
+            .collect()
+    }
+
+    /// 该对外名是否已存在任何映射条目（种子防抢占判断用）。
+    pub fn has_alias(&self, alias: &str) -> bool {
+        self.mappings.iter().any(|m| m.alias.eq_ignore_ascii_case(alias))
+    }
+
+    /// 某条映射的对外名：target 归属 `provider`（None = 旧版全局条目）。
+    ///
+    /// 管理页按「提供商 × 模型 id」分行渲染：全局条目在所有承载 target 的行
+    /// 上都显示（旧行为），带 provider 的条目只显示在自己那家的行上。
+    ///
+    /// **刻意不过滤 disabled**：本函数唯一的消费点是 `catalog::manage_view` 的
+    /// 行内 `aliases` 数组，那是管理页的展示视图 —— 关闭的映射必须继续显示
+    /// （chip 还在行上，用户要能看见它、把开关再打开）。过滤后 chip 会凭空
+    /// 消失，「我关了个开关，映射怎么没了」是个查不出的问题。转发生效视图
+    /// 一律走 `mappings_of`（那里过滤），两个口径的分工见它的注释。
+    pub fn aliases_of(&self, provider: &str, target: &str) -> Vec<&str> {
+        self.mappings
+            .iter()
+            .filter(|m| m.target.eq_ignore_ascii_case(target))
+            .filter(|m| m.provider.as_deref().map_or(true, |p| p.eq_ignore_ascii_case(provider)))
+            .map(|m| m.alias.as_str())
+            .collect()
+    }
+
+    /// 指向某上游模型名的全部对外名（**跨提供商**、去重；忽略大小写比对去重键）。
+    ///
+    /// `/v1/models` 是一个平面对外目录：同一个对外名无论有几家通过映射提供，
+    /// 都只广告一条。
+    ///
+    /// **只统计 enabled 的条目**：本函数的全部消费点都是对外生效视图 ——
+    /// `models_response` 的别名广告段、`advertised_manifest_contains`（入口
+    /// 「广告里有才放行」校验）、`advertised_model_ids`（相近模型提示）、
+    /// `models_by_provider`（Key 页的可勾模型候选）—— 关闭的映射不广告、
+    /// 也调不通，四处自动同口径，不会出现「列表里看不到却能调通」的缝。
+    /// 管理页的全量视图走 `aliases_of`（那里不过滤，见它的注释）。
+    pub fn aliases_of_any(&self, target: &str) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for m in &self.mappings {
+            if m.enabled
+                && m.target.eq_ignore_ascii_case(target)
+                && !out.iter().any(|a| m.alias.eq_ignore_ascii_case(*a))
+            {
+                out.push(m.alias.as_str());
+            }
+        }
+        out
+    }
+
+    /// 该 (provider, id) 是否已做过默认规则种子。
+    ///
+    /// ── 旧版纯 id 条目的兼容**只对 workbuddy / raccoon 成立**（别放宽）──
+    /// 升级前的 `seeded` 存的是纯 id（旧版种子是全局动作），读取时对这两家
+    /// 保留「纯 id 也算已种」的兼容：重种一遍只是把同样的默认值再写一次，
+    /// 没必要。
+    ///
+    /// ── WorkBuddy 国际版**不继承**国内版的种子标记（2026-10 拆家）────
+    /// `migrate_workbuddy_split` 会把 `workbuddy:<id>` 的标记**复制**一份给
+    /// 国际版（那条迁移在拆家那一刻跑一次）。但读取层**不能**在这里把
+    /// 「`workbuddy:<id>` 存在」当成「`workbuddy-intl:<id>` 已种」：
+    /// 拆家之后新出现在国际版清单里的模型必须按正常种子路径判一次
+    /// （不在白名单里就默认禁用），而继承国内版的标记会让它们直接跳过种子、
+    /// 默认全开。两件事各归各处：迁移负责存量，读取层不猜。
+    ///
+    /// 但这个兼容**不能给所有 provider 开**：Qoder 的目录里有 `Auto` /
+    /// `GLM-5.3` / `DeepSeek-V4-Pro` 这类与 workbuddy / raccoon 清单**同名**的
+    /// 模型，它们的纯 id 早已躺在旧版 `seeded` 里 —— 一律算已种的话，Qoder
+    /// 这几个模型会**跳过白名单种子**而在全新安装上默认启用，与「只默认开
+    /// Qwen3.8-Flash」的预期正好相反。旧版种子从未处理过 Qoder，
+    /// 那批标记对 Qoder 不构成「已种」的证据。
+    fn is_seeded(&self, provider: &str, id: &str) -> bool {
+        let key = format!("{provider}:{id}");
+        if self.seeded.iter().any(|item| item.eq_ignore_ascii_case(&key)) {
+            return true;
+        }
+        if !matches!(provider, "workbuddy" | "raccoon") {
+            return false;
+        }
+        self.seeded.iter().any(|item| item.eq_ignore_ascii_case(id))
+    }
+}
+
+/// 当前生效的规则
+pub fn current() -> ModelRules {
+    ModelRules::from_raw(config::current().raw())
+}
+
+fn save(rules: &ModelRules) -> bool {
+    config::update_raw_field(KEY_MODEL_RULES, rules.to_value())
+}
+
+/// 把 `(provider, id)` 的**启用**落到列表上。
+///
+/// 启用某一家时，直接移除该家的条目就够；但如果存在旧版的**全局条目**
+/// （provider=None，对所有提供商生效），只移除它会把其他家也一并放开 ——
+/// 那不是用户的意图。此时把全局条目替换为「其余当前也提供该模型的家」的
+/// 精确条目：它们的禁用状态原样保留，目标家则恢复可用。其余各家取自
+/// `other_providers`（调用方从当前清单里取，见 `api::model_manage`）。
+fn enable_on(list: &mut Vec<RuleEntry>, provider: &str, id: &str, other_providers: &[String]) {
+    let had_global = list
+        .iter()
+        .any(|entry| entry.provider.is_none() && entry.id.eq_ignore_ascii_case(id));
+    list.retain(|entry| !entry.matches(provider, id));
+    if had_global {
+        // 全局条目展开：其他家逐家补条目（已有的保持原样，不重复加）
+        for other in other_providers {
+            if other.eq_ignore_ascii_case(provider) {
+                continue;
+            }
+            if !ModelRules::hit(list, other, id) {
+                list.push(RuleEntry::new(Some(other), id));
+            }
+        }
+    }
+}
+
+/// 设置某模型的启用状态（`None` = 该项不动）。
+///
+/// `provider` 是规则的目标提供商；`None` 走**旧版全局语义**（只有旧前端会
+/// 这么传），enabled=false 等价于「对所有提供商禁用」，enabled=true 等价于
+/// 「清掉该 id 的全部条目」—— 与升级前行为完全一致。
+///
+/// 旧版的 `hidden` 参数已随「删除/恢复」机制移除（API 层对残留请求报 400，
+/// 见 `api::model_manage::set_state`）；本函数只剩 enabled 一根轴，
+/// `enable_on` / `set_membership` 的既有逻辑原样保留。
+///
+/// `other_providers`：当前清单里同样提供该模型的其他提供商（启用分支展开
+/// 全局条目时用）；调用方从 catalog 取，这里不回头依赖目录模块。
+pub fn set_state(
+    provider: Option<&str>,
+    id: &str,
+    enabled: Option<bool>,
+    other_providers: &[String],
+) -> Result<ModelRules, String> {
+    let mut rules = current();
+    if let Some(enabled) = enabled {
+        if enabled {
+            match provider {
+                Some(provider) => enable_on(&mut rules.disabled, provider, id, other_providers),
+                None => rules.disabled.retain(|entry| !entry.id.eq_ignore_ascii_case(id)),
+            }
+        } else {
+            set_membership(&mut rules.disabled, provider, id, true);
+        }
+        // 历史同名映射和默认绑定共用一个开关，不能留下第二个关闭来源。
+        for mapping in &mut rules.mappings {
+            if mapping.alias.eq_ignore_ascii_case(id) && mapping.target.eq_ignore_ascii_case(id)
+                && provider.map_or(true, |owner| mapping.provider.as_deref() == Some(owner))
+            {
+                mapping.enabled = enabled;
+            }
+        }
+        if let Some(owner) = provider {
+            if let Some(global) = rules.mappings.iter().find(|mapping| {
+                mapping.provider.is_none() && mapping.alias.eq_ignore_ascii_case(id)
+                    && mapping.target.eq_ignore_ascii_case(id)
+            }).cloned() {
+                if !rules.mappings.iter().any(|mapping| mapping.provider.as_deref() == Some(owner)
+                    && mapping.alias.eq_ignore_ascii_case(id) && mapping.target.eq_ignore_ascii_case(id))
+                {
+                    rules.mappings.push(Mapping { provider: Some(owner.to_string()), enabled, ..global });
+                }
+            }
+        }
+    }
+    if !save(&rules) {
+        return Err("模型开关保存失败".to_string());
+    }
+    Ok(rules)
+}
+
+/// 把 `(provider, id)` 的**禁用**落到列表上（幂等；provider=None = 全局）
+fn set_membership(list: &mut Vec<RuleEntry>, provider: Option<&str>, id: &str, present: bool) {
+    list.retain(|entry| !(entry.provider == provider.map(str::to_string) && entry.id.eq_ignore_ascii_case(id)));
+    if present {
+        list.push(RuleEntry::new(provider, id));
+    }
+}
+
+/// alias 允许的字符：字母 / 数字 / `- _ . / :`
+pub fn alias_valid(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias.len() <= 128
+        && alias
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':'))
+}
+
+/// 新增映射（照抄 OmniProxy：追加式，同名 alias 允许多条 —— 不同提供商各建
+/// 一条即为主备）。`provider` 是 target 所属的家（新条目总是带；None = 旧版
+/// 全局语义，由所有承载 target 的家接收）。
+///
+/// 完全相同的条目（alias + target + provider 全同）幂等跳过；「alias 与上游 id
+/// 同名」「同一 alias 多条」都不再是错误 —— 前者正是同名主备的用法，后者就是
+/// 多提供商兜底本身。
+///
+/// ── 已存在的条目也要能改思考等级（`reasoning`）───────────────
+/// 幂等判定的键仍是三元组（不带 `reasoning`）：同一 (alias, target, provider)
+/// 上的思考等级是**可编辑的属性**，不是身份的一部分。所以三元组命中时要把
+/// 传入的 `reasoning` 写上去（而不是整条跳过）—— 否则管理页上对已有映射改等级
+/// 会静默无效，看起来像「保存成功了、刷新又变回去」。
+///
+/// 代价要说清：这也意味着 `add_mapping` 传了 `reasoning = None` 时会**清掉**
+/// 那条已有的绑定。调用方（`api::model_manage::add_mapping`）因此只在请求体里
+/// **带有** `reasoning` 键时才传 `Some(...)`/`Some(None)`，完全不带该键时走
+/// 「不动等级」的语义 —— 见那个 handler 的取值。
+///
+/// ── `enabled` 的三态（与 `reasoning` 完全同一套写法）──────────
+/// `None` = 请求体没带这个键 → 不动已有条目的开关 / 新建条目默认 true；
+/// `Some(false)` / `Some(true)` = 显式关 / 显式开。管理页切换映射开关走的
+/// 就是这条接口：只传 (alias, target, provider, enabled) 四项 —— 不带
+/// `reasoning` 不动等级、带 `enabled` 改开关，两个三态参数各管各的字段，
+/// 两条路径互补而不干扰。
+pub fn add_mapping(
+    alias: &str,
+    target: &str,
+    provider: Option<&str>,
+    reasoning: Option<Option<&str>>,
+    enabled: Option<bool>,
+    other_providers: &[String],
+) -> Result<ModelRules, String> {
+    let mut rules = current();
+    let inherited = provider.and_then(|owner| rules.binding(owner, alias, target).cloned());
+    let mut touched = false;
+    if alias.eq_ignore_ascii_case(target) {
+        if let Some(enabled) = enabled {
+            if enabled {
+                match provider {
+                    Some(owner) => enable_on(&mut rules.disabled, owner, target, other_providers),
+                    None => rules.disabled.retain(|entry| !entry.id.eq_ignore_ascii_case(target)),
+                }
+            } else {
+                set_membership(&mut rules.disabled, provider, target, true);
+            }
+            touched = true;
+        }
+    }
+    if let Some(existing) = rules.mappings.iter_mut().find(|m| {
+        m.alias.eq_ignore_ascii_case(alias)
+            && m.target.eq_ignore_ascii_case(target)
+            && m.provider.as_deref().map_or(provider.is_none(), |p| {
+                provider.map_or(false, |given| p.eq_ignore_ascii_case(given))
+            })
+    }) {
+        if let Some(next) = reasoning {
+            // `Some(None)` = 显式清空；`Some(Some(x))` = 设成 x
+            let next = next.and_then(normalize_reasoning);
+            if existing.reasoning != next {
+                existing.reasoning = next;
+                touched = true;
+            }
+        }
+        if let Some(next) = enabled {
+            if existing.enabled != next {
+                existing.enabled = next;
+                touched = true;
+            }
+        }
+    } else {
+        rules.mappings.push(Mapping {
+            alias: alias.to_string(),
+            target: target.to_string(),
+            provider: provider.map(str::to_string),
+            reasoning: match reasoning {
+                Some(value) => value.and_then(normalize_reasoning),
+                None => inherited.as_ref().and_then(|mapping| mapping.reasoning.clone()),
+            },
+            enabled: enabled.unwrap_or_else(|| inherited.as_ref().map_or(true, |mapping| mapping.enabled)),
+        });
+        touched = true;
+    }
+    if touched && !save(&rules) {
+        return Err("模型绑定保存失败".to_string());
+    }
+    Ok(rules)
+}
+
+/// 新增一条自定义模型（幂等：同 `(provider, id)` 已存在时不动）。
+///
+/// 与 `add_mapping` 的幂等口径一致：重复提交同一条不算错误、也不产生第二条 ——
+/// 管理页的保存键被连点两次是最常见的来源。
+pub fn add_custom(provider: &str, id: &str) -> ModelRules {
+    let mut rules = current();
+    let exists = rules.custom.iter().any(|item| item.matches(provider, id));
+    if !exists {
+        rules.custom.push(CustomModel {
+            provider: provider.to_string(),
+            id: id.to_string(),
+        });
+        save(&rules);
+    }
+    rules
+}
+
+/// 删除一条自定义模型；返回 `(规则快照, 是否真的删掉了)`。
+///
+/// ── 为什么顺带清理针对它的规则 ──────────────────────────────
+/// 自定义条目一旦移除，它就彻底不在清单里了，此时 `disabled` 里针对它的
+/// 条目、以及指向它的映射，都成了永远挂不上任何一行的孤儿：
+/// 「未挂载的映射」里会多一条永远解释不清的条目。所以在这里一并清掉。
+///
+/// 清理是**尽力而为**：`(provider, id)` 精确匹配的那几条删掉，旧版全局条目
+/// （provider 为 None）不动 —— 它可能同时服务别家，删它会误伤（与 `enable_on`
+/// 的取舍一致：展开与清理都只碰能精确定位的那部分）。
+pub fn remove_custom(provider: &str, id: &str) -> (ModelRules, bool) {
+    let mut rules = current();
+    let before = rules.custom.len();
+    rules.custom.retain(|item| !item.matches(provider, id));
+    let removed = rules.custom.len() != before;
+    if removed {
+        // 精确匹配的启停规则
+        rules
+            .disabled
+            .retain(|entry| !entry.matches(provider, id));
+        // 指向这个模型的映射（带 provider 的那种才算得准）
+        rules.mappings.retain(|mapping| {
+            !(mapping.target.eq_ignore_ascii_case(id)
+                && mapping
+                    .provider
+                    .as_deref()
+                    .is_some_and(|owner| owner.eq_ignore_ascii_case(provider)))
+        });
+        // 针对它的能力覆盖（provider 必填，matches 就是精确定位）
+        rules.capabilities.retain(|entry| !entry.matches(provider, id));
+        save(&rules);
+    }
+    (rules, removed)
+}
+
+/// 把该家的能力覆盖写进整份清单（内置家清单出口的统一调用点，见
+/// `providers::catalog::manifest_for`）。
+///
+/// 收在「整份清单一次」而不是「一条条目一次」，是性能上的硬约束：
+/// `current()` 每次调用都要重新解析整份 modelRules，逐条调用会让一次
+/// `/v1/models` 把同一份配置解析几百遍。
+pub fn apply_capability_overrides(provider: &str, items: &mut [Value]) {
+    let rules = current();
+    if rules.capabilities.is_empty() {
+        return;
+    }
+    for item in items.iter_mut() {
+        let id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if id.is_empty() {
+            continue;
+        }
+        if let Some(entry) = rules
+            .capabilities
+            .iter()
+            .find(|entry| entry.matches(provider, id))
+        {
+            crate::server::core::capability::apply_overrides(item, &entry.values);
+            // 来源标记：被覆盖的键从此是**用户指定**的值，既不是上游给的也不是
+            // models.dev 补的（管理页要把这三档分开显示，见 `core::model_meta`
+            // 的模块头）。覆盖在 models.dev 补齐**之后**执行，所以这里改的是
+            // 已经标好的那几项。
+            crate::server::core::model_meta::mark_user(
+                item,
+                &crate::server::core::capability::overridden_keys(&entry.values),
+            );
+        }
+    }
+}
+
+/// 应用一次能力覆盖补丁：`(provider, id)` × `patch`（管理页「模型能力」弹窗的
+/// 保存入口）。
+///
+/// `patch` 的三态（与本模块其它写接口同一套协议）：
+///   · 键**缺失**   → 不改这一项；
+///   · 键给 `null`  → **清除**这一项的覆盖（回到清单原值）；
+///   · 键给合法值   → 覆盖这一项（合法值判定在 `core::capability`；非法值
+///                     在这里被丢弃 —— API 层已经拦过一遍，这层是防御）。
+///
+/// 清除到一项不剩的条目**整条移除**（与读取侧的「空条目丢弃」同一口径：
+/// 空覆盖等价于没有覆盖）。落盘失败返回 Err，调用方按整体失败处理。
+pub fn set_capabilities(
+    provider: &str,
+    id: &str,
+    patch: &Map<String, Value>,
+) -> Result<ModelRules, String> {
+    let mut rules = current();
+    let index = rules
+        .capabilities
+        .iter()
+        .position(|entry| entry.matches(provider, id));
+    let mut values = match index {
+        Some(index) => rules.capabilities[index].values.clone(),
+        None => Map::new(),
+    };
+    for (key, value) in patch {
+        if value.is_null() {
+            values.remove(key);
+        } else if let Some(normalized) =
+            crate::server::core::capability::normalize_value(key, value)
+        {
+            values.insert(key.clone(), normalized);
+        }
+    }
+    match index {
+        Some(index) if values.is_empty() => {
+            rules.capabilities.remove(index);
+        }
+        Some(index) => rules.capabilities[index].values = values,
+        // 新条目且归一后为空 = 这次补丁什么都没改（API 层已拦非法值，
+        // 走到这里只剩「全清一个本来不存在的覆盖」这类空操作）
+        None if values.is_empty() => return Ok(rules),
+        None => rules.capabilities.push(CapabilityOverride {
+            provider: provider.to_string(),
+            id: id.to_string(),
+            values,
+        }),
+    }
+    if !save(&rules) {
+        return Err("模型能力保存失败".to_string());
+    }
+    Ok(rules)
+}
+
+/// 该 `(provider, id)` 是否是用户手动登记的自定义模型。
+///
+/// 消费方：管理页判「来源 = 手动」（`catalog::manage_entries`）、以及 AutoClaw
+/// 的模型路由解析（未知名字不静默回落，见 `autoclaw::models::resolve_model_route`）。
+pub fn is_custom(provider: &str, id: &str) -> bool {
+    current().custom.iter().any(|item| item.matches(provider, id))
+}
+
+/// 某一家当前登记的自定义模型，转成**聚合层认的条目形态**。
+///
+/// ── 形状（为什么只有这几个键）───────────────────────────────
+/// `id` / `name` 都用用户填的那个 id：下游看到的名称与请求名一致，不会出现
+/// 「列表里叫 A、请求要用 B」的困惑。**不编造能力位**（`maxOutputTokens` 等）——
+/// 用户无从知道真实值，给一个默认值等于让 `/v1/models` 对下游撒谎。
+/// `list_item` 对缺失键的行为是「整键省略」（与图像模型同款），下游据此保守
+/// 处理，比给错值好。
+///
+/// `isDefault` 恒 false：默认模型是各家目录自己的概念（当前只有 workbuddy 认），
+/// 手动登记的条目不该去争这个位。
+///
+/// ── 为什么是「调用时现算」而不是缓存 ─────────────────────────
+/// 数据源是 `model_rules::current()`（内存快照），条目通常只有几条，
+/// 现算一次的成本远低于维护一份会与配置失同步的缓存。
+pub fn custom_models_for(provider: &str) -> Vec<Value> {
+    current()
+        .custom
+        .iter()
+        .filter(|item| item.provider.eq_ignore_ascii_case(provider))
+        .map(|item| {
+            json!({
+                "id": item.id,
+                "name": item.id,
+                "isDefault": false,
+                "kind": "chat",
+            })
+        })
+        .collect()
+}
+
+/// 删除一条映射（按 alias + target + provider 精确定位）；返回是否存在。
+///
+/// 同名映射允许多条后，按 alias 单独删会有歧义 —— 管理页的每条 chip 都带着
+/// 它所在行的提供商信息，删除时一并传入。
+///
+/// ── 旧版全局条目（provider 缺失）的命中口径与展示一致 ──────────
+/// 展示侧（[`ModelRules::aliases_of`]）把全局条目显示在**所有承载 target 的
+/// 家**的行上；删除侧必须同口径，否则升级用户盘上的旧条目会「看得见却删不掉」
+/// （chip 带着行提供商来删，旧实现只认 provider 也缺失的请求，必然报不存在）。
+///
+/// 但全局条目的语义是「所有承载 target 的家」，直接删掉会连带影响别家 ——
+/// 与 `enable_on` 同一取舍：指名某家删除时把它**展开**成「其余承载 target 的
+/// 家」的精确条目，目标家的那一条才真的消失。`other_providers` 由调用方从
+/// 当前清单取（与 `set_state` 同），只有 target 被多家承载时展开才有内容。
+///
+/// `provider` 为 `None`（旧前端 / 无行上下文）时走旧版全局语义：命中该
+/// (alias, target) 的全部条目，一次删干净。
+pub fn remove_mapping(
+    alias: &str,
+    target: &str,
+    provider: Option<&str>,
+    other_providers: &[String],
+) -> (ModelRules, bool) {
+    let mut rules = current();
+    let mut removed = false;
+    let mut global_hit = false;
+    rules.mappings.retain(|m| {
+        if !(m.alias.eq_ignore_ascii_case(alias) && m.target.eq_ignore_ascii_case(target)) {
+            return true;
+        }
+        let hit = match (m.provider.as_deref(), provider) {
+            // 带 provider 的条目：指名那家才命中；不指名 = 全删（旧版语义）
+            (Some(stored), Some(given)) => stored.eq_ignore_ascii_case(given),
+            (Some(_), None) => true,
+            // 旧版全局条目：对任何家都命中（与展示同口径）
+            (None, _) => {
+                global_hit = true;
+                true
+            }
+        };
+        if hit {
+            removed = true;
+        }
+        !hit
+    });
+    if removed && global_hit {
+        if let Some(owner) = provider {
+            // 全局条目展开：其余承载 target 的家逐家补精确条目（已有的不重复加），
+            // 于是「在 A 家行上删掉」不会顺手把 B 家的映射也弄丢
+            for other in other_providers {
+                if other.eq_ignore_ascii_case(owner) {
+                    continue;
+                }
+                let exists = rules.mappings.iter().any(|m| {
+                    m.alias.eq_ignore_ascii_case(alias)
+                        && m.target.eq_ignore_ascii_case(target)
+                        && m.provider
+                            .as_deref()
+                            .map_or(false, |p| p.eq_ignore_ascii_case(other))
+                });
+                if !exists {
+                    rules.mappings.push(Mapping {
+                        alias: alias.to_string(),
+                        target: target.to_string(),
+                        provider: Some(other.to_string()),
+                        reasoning: None,
+                        // 展开补出来的条目继承「映射本来生效」的事实：
+                        // 被删的那条是全局条目（对这家也是开着的）
+                        enabled: true,
+                    });
+                }
+            }
+        }
+    }
+    if removed {
+        save(&rules);
+    }
+    (rules, removed)
+}
+
+// ─── 小浣熊清单的默认规则种子 ────────────────────
+
+/// 小浣熊的「内部模型」id：`raccoon-` 后跟一段**纯十六进制**短哈希
+/// （`raccoon-8c4485` / `raccoon-19b265` / `raccoon-405a1c` 这种 Work 模型的
+/// 内部代号）。`raccoon-chat-ml-5-5` 这类正经命名不会命中。
+fn is_opaque_raccoon_id(id: &str) -> bool {
+    match id.strip_prefix("raccoon-") {
+        Some(rest) => !rest.is_empty()
+            && rest.len() <= 8
+            && rest.chars().all(|c| c.is_ascii_hexdigit()),
+        None => false,
+    }
+}
+
+/// 各家的**额外对外名**：`(provider, 上游 id, 额外别名)`。
+///
+/// ── 为什么除「去前缀」外还需要这张表 ───────────────────────────
+/// 去前缀种子只把上游 id 的前缀剥掉，得到的是**上游自己的拼法**；
+/// 而下游（以及 WorkBuddy 那家）习惯的拼法未必相同，名字对不上就命不中这条链路，
+/// 跨家的主备切换断掉一半。这张表按「上游 id → 额外别名」点名补挂，
+/// 同一 alias 允许多家各一条（见模块头），不会遮蔽任何东西，只是把候选链补全。
+///
+/// 四组现有条目的来由：
+///   - 小浣熊把 4.1 写成连字符（`sn-deepseek-v4-1-flash`），去前缀只能给出
+///     `deepseek-v4-1-flash`，而下游习惯点号写法；
+///   - Cline 的 `deepseek-v4.1-flash` **两池都有**（`cline-free/` 与
+///     `cline-pass/`），两池现在是两家 provider，各自跑一遍去前缀种子 ——
+///     先刷到的那家拿到那条短名，另一家只记 seeded 不建映射。这里**两家都
+///     点名**，于是短名默认就有两条映射、各指一个池，不依赖清单刷新顺序：
+///     路由时两条一起进候选链，发送名跟着实际承载的 provider 走
+///     （见 `catalog::wire_target_for_provider` 的 ②）。缺了任何一条，
+///     「短名默认能路由到那个池」这件事就会随刷新顺序时断时续。
+///   - `glm-5.3-flash` 同理但**更隐蔽**：免费池那条是裸 id
+///     （`z-ai/glm-5.3-flash`，剥厂商前缀得到短名），订阅池那条带通道前缀
+///     （`cline-pass/glm-5.3-flash`，剥通道前缀得到同一个短名）—— 两条来自
+///     **不同的剥离规则**却撞在同一个短名上，同样会「先到先得」，所以也两家
+///     都点名。它还与 CatPaw / AutoClaw 的原生 id 同名，那不影响：
+///     同一对外名由多家承载正是主备路由的常态。
+const EXTRA_ALIASES: &[(&str, &str, &str)] = &[
+    ("raccoon", "sn-deepseek-v4-1-flash", "deepseek-v4.1-flash"),
+    // 两家 provider id 从 `Pool` 推导，别处已无 `"cline"` 这个 id（见
+    // `providers::PROVIDERS` 的 cline-free / cline-pass 两条）
+    ("cline-free", "cline-free/deepseek-v4.1-flash", "deepseek-v4.1-flash"),
+    ("cline-pass", "cline-pass/deepseek-v4.1-flash", "deepseek-v4.1-flash"),
+    // 免费池的裸 id：短名 `glm-5.3-flash` 与订阅池那条撞名（见上文）
+    ("cline-free", "z-ai/glm-5.3-flash", "glm-5.3-flash"),
+    ("cline-pass", "cline-pass/glm-5.3-flash", "glm-5.3-flash"),
+];
+
+/// 额外别名的种子键：`<provider>:<id>#alias:<alias>`。
+///
+/// 与主 seeded 键**分开**的理由：这些模型在第一次出现时就被主种子记过
+/// （存量用户的盘上早有 `<provider>:<id>`），若额外别名跟着主键一起短路，
+/// 这张表里新加的条目在存量用户那里永远种不上。
+/// `#alias:` 后缀不会与任何真实模型 id 相等，不干扰 `is_seeded` 的等值比较。
+fn extra_alias_key(provider: &str, id: &str, alias: &str) -> String {
+    format!("{provider}:{id}#alias:{alias}")
+}
+
+/// 给 `EXTRA_ALIASES` 里该家点名的模型补额外对外名。
+///
+/// 返回是否动过 `seeded`：动过就要落盘（否则用户删掉这条映射后，
+/// 下一次清单刷新会再把它加回来）。
+fn seed_extra_aliases(
+    rules: &mut ModelRules,
+    provider: &str,
+    id: &str,
+    ids: &[String],
+    added: &mut Vec<String>,
+) -> bool {
+    let mut touched = false;
+    for (owner, target, alias) in EXTRA_ALIASES {
+        if !owner.eq_ignore_ascii_case(provider) || !target.eq_ignore_ascii_case(id) {
+            continue;
+        }
+        let key = extra_alias_key(provider, id, alias);
+        if rules.seeded.iter().any(|item| item.eq_ignore_ascii_case(&key)) {
+            continue;
+        }
+        rules.seeded.push(key);
+        touched = true;
+        // 别名与本家清单里另一个上游 id 撞名 → 不种（与去前缀种子同一口径）
+        if ids.iter().any(|other| other.eq_ignore_ascii_case(alias)) {
+            continue;
+        }
+        // 已有同 (alias, provider, target) 的条目（用户手动加过 / 旧版残留）就不重复加。
+        // 同 alias 允许多家各一条、**同一家也可以有多条**（各自指向不同的池 /
+        // 上游 id，路由时一起进候选链、发送名各按自己的 target 改写），
+        // 所以判重按三元组，而不是像去前缀种子那样「alias 被任何人占用就不动」
+        //（点号别名天生与 WorkBuddy 的原生 id 同名，正是要共存）。
+        // provider=None 的旧版全局条目（「所有承载 target 的家」）已覆盖本家，
+        // 也算已存在 —— 不算的话，升级用户盘上会同时留一条旧 null 与一条新
+        // provider 版的同义映射，管理页一屏两个 chip。
+        let exists = rules.mappings.iter().any(|m| {
+            m.alias.eq_ignore_ascii_case(alias)
+                && m.target.eq_ignore_ascii_case(target)
+                && m.provider.as_deref().map_or(true, |p| p.eq_ignore_ascii_case(provider))
+        });
+        if exists {
+            continue;
+        }
+        rules.mappings.push(Mapping {
+            alias: alias.to_string(),
+            target: id.to_string(),
+            provider: Some(provider.to_string()),
+            // 种子建的映射不绑思考等级（那是用户手动绑定的东西）
+            reasoning: None,
+            // 种子建的就是「生效」的映射；用户此后把它关掉是自己的决定，
+            // seeded 只防「删掉后被重种」，关掉的不会被重开（exists 判重挡着）
+            enabled: true,
+        });
+        added.push(format!("{alias} → {id}"));
+    }
+    touched
+}
+
+
+/// 小浣熊清单的**默认规则种子**：对 `ids` 里每个还没种过的模型做一次默认处理 ——
+///
+///   - `raccoon-<hex>` 内部模型 → 默认**禁用**（对外不可见；管理页里仍可看到并手动启用）；
+///   - `sn-` 前缀的模型 → 默认加一条**去前缀映射**（`sn-glm-5-3` → `glm-5-3`），
+///     客户端用两种名字都行；去前缀后的名字若已被映射占用、或与小浣熊自己的
+///     另一个上游模型 id 撞名，则跳过（照常记入 seeded，不再反复尝试）；
+///   - `RACCOON_EXTRA_ALIASES` 点名的模型 → 再补一条额外对外名（如点号写法），
+///     这条与主种子**独立计时**（见 `extra_alias_key`）。
+///
+/// 处理过的 (provider, id) 记入 `seeded`（持久化在 modelRules 里）：之后用户手动启用某个
+/// 内部模型、或删掉某条自动映射，清单刷新都不会把它们改回去；上游将来新增的
+/// `sn-` 模型因为 id 没种过，会在下一次种子时自动获得映射。
+///
+/// 只处理小浣熊的清单；调用点在清单落地 / 刷新编排处（见 raccoon::models）。
+/// 返回给日志的摘要；没有任何新模型时返回 None（不落盘）。
+pub fn seed_raccoon_defaults(ids: &[String]) -> Option<String> {
+    let mut rules = current();
+    let mut disabled_added: Vec<String> = Vec::new();
+    let mut mappings_added: Vec<String> = Vec::new();
+    let mut aliases_seeded = false;
+    for id in ids {
+        let id = id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        // 额外对外名先处理：**不受下面主 seeded 短路影响**（理由见 extra_alias_key）
+        aliases_seeded |= seed_extra_aliases(&mut rules, "raccoon", id, ids, &mut mappings_added);
+        if rules.is_seeded("raccoon", id) {
+            continue;
+        }
+        rules.seeded.push(format!("raccoon:{id}"));
+        if is_opaque_raccoon_id(id) {
+            // 已在 disabled 里就不重复计数（set_membership 本身幂等）
+            if !rules.is_disabled("raccoon", id) {
+                set_membership(&mut rules.disabled, Some("raccoon"), id, true);
+                disabled_added.push(id.to_string());
+            }
+        } else if let Some(alias) = id.strip_prefix("sn-") {
+            if alias.is_empty() || !alias_valid(alias) {
+                continue;
+            }
+            // alias 已有映射（不管是自动还是人工）或与小浣熊自己的上游 id 撞名 → 不动
+            if rules.has_alias(alias)
+                || ids.iter().any(|other| other.eq_ignore_ascii_case(alias))
+            {
+                continue;
+            }
+            rules.mappings.retain(|m| {
+                !(m.alias.eq_ignore_ascii_case(alias) && m.provider.as_deref() == Some("raccoon"))
+            });
+            rules.mappings.push(Mapping {
+                alias: alias.to_string(),
+                target: id.to_string(),
+                provider: Some("raccoon".to_string()),
+                reasoning: None,
+                enabled: true,
+            });
+            mappings_added.push(format!("{alias} → {id}"));
+        }
+    }
+    if disabled_added.is_empty() && mappings_added.is_empty() && !aliases_seeded {
+        return None;
+    }
+    save(&rules);
+    if disabled_added.is_empty() && mappings_added.is_empty() {
+        // 只补记了「额外别名已种过」的标记（映射本来就在）——不写日志噪音
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !disabled_added.is_empty() {
+        parts.push(format!("默认禁用内部模型 [{}]", disabled_added.join(", ")));
+    }
+    if !mappings_added.is_empty() {
+        parts.push(format!("默认新增映射 [{}]", mappings_added.join(", ")));
+    }
+    Some(format!("🧩 小浣熊模型默认规则: {}", parts.join("；")))
+}
+
+// ─── 各清单的「默认启用白名单」种子 ────────────────────
+
+/// Qoder 清单的**默认启用白名单**：同 WorkBuddy 种子的语义，只是白名单里
+/// 只留一个模型。
+///
+/// ── 为什么 Qoder 只留 Qwen3.8-Flash ────────────────────────
+/// Qoder 是 agent 形态的上游，目录里绝大多数条目要么是**套餐档位别名**
+/// （`Auto` / `Ultimate` / `Performance` / `Efficient` / `Sonus` / `Cantus`），
+/// 要么是需要更高档套餐才可用的模型。默认全开会让这台网关对外的模型列表
+/// 凭空多出十几个用户几乎不会点名的名字，而且它们还会参与 `/v1/models` 的
+/// 同名认领 —— 把别家真正在用的同名模型（如 `GLM-5.3` / `Kimi-K3`）挤掉。
+/// `Qwen3.8-Flash` 是免费档通常可用的那个（静态兜底清单里 `enabled` 恒为真
+/// 的两个 Qwen3.8 系模型之一，且面向日常对话），拿它当唯一默认项最贴近
+/// 「装上就能用」的预期。
+pub const QODER_DEFAULT_ENABLED: &[&str] = &["Qwen3.8-Flash"];
+
+/// Qoder 清单的**默认规则种子**：语义与 [`seed_workbuddy_defaults`] 完全一致，
+/// 只是白名单是 [`QODER_DEFAULT_ENABLED`]。
+///
+/// 调用点同样两类：清单**首次落地**（`providers::qoder::models::refresh`，远程
+/// 目录从上游拉回来时），以及编排入口对**当前缓存清单**的补种（见
+/// `providers::adapter` 的 `seed_current_qoder_defaults` —— 覆盖「有账号但远程
+/// 刷新失败，手里只有静态兜底清单」与升级用户首次打开管理页的情形）。
+pub fn seed_qoder_defaults(provider: &str, label: &str, ids: &[String]) -> Option<String> {
+    seed_default_enabled(provider, label, QODER_DEFAULT_ENABLED, ids)
+}
+
+/// 「默认启用白名单」种子的公共实现（WorkBuddy 与 Qoder 共用）。
+///
+/// 对 `ids` 里每个还没种过的模型：不在 `whitelist` 里的默认禁用，并把
+/// `(provider, id)` 记入 `seeded`。`label` 只进日志文案。
+///
+/// ── 为什么 seeded 单独变化也要落盘（而不是只看「有没有新禁用」）──────
+/// 旧实现只在「这次真禁用了某个模型」时才 save，于是「模型已被别处的规则
+/// 禁用 → 本次没有新禁用 → seeded 没落地」这个组合下，下次启动会**重种一遍** ——
+/// 用户在这期间手动启用过它的话，会被这一次重种悄悄改回禁用。种子是
+/// 「只对首次出现生效」的承诺，那承诺必须落盘才算数。
+fn seed_default_enabled(
+    provider: &str,
+    label: &str,
+    whitelist: &[&str],
+    ids: &[String],
+) -> Option<String> {
+    let mut rules = current();
+    let seeded_before = rules.seeded.len();
+    let mut disabled_added: Vec<String> = Vec::new();
+    for id in ids {
+        let id = id.trim();
+        if id.is_empty() || rules.is_seeded(provider, id) {
+            continue;
+        }
+        rules.seeded.push(format!("{provider}:{id}"));
+        let default_enabled = whitelist.iter().any(|name| name.eq_ignore_ascii_case(id));
+        if !default_enabled && !rules.is_disabled(provider, id) {
+            set_membership(&mut rules.disabled, Some(provider), id, true);
+            disabled_added.push(id.to_string());
+        }
+    }
+    if rules.seeded.len() == seeded_before {
+        // 没有新模型：一个字节都不用落盘
+        return None;
+    }
+    save(&rules);
+    if disabled_added.is_empty() {
+        // 有新的种子标记、但都被别处的规则禁着了 —— 落盘即可，日志不必吵
+        return None;
+    }
+    Some(format!(
+        "🧩 {label}模型默认规则: 默认只启用 [{}]；默认禁用 {} 个 [{}]",
+        whitelist.join(", "),
+        disabled_added.len(),
+        disabled_added.join(", ")
+    ))
+}
