@@ -115,17 +115,17 @@ COPY desktop-tauri/ui /app/ui
 # 鉴权：面板需要管理员（登录页注册或 env 预置）；未配置任何 API Key 时
 # /v1/* 处于 fail-closed（登录面板创建第一把后自动恢复）。
 # AGENT2API_CAPTCHA_ENABLED：登录页人机验证组件环境变量，默认为1开启，0为关闭。
-# AGENT2API_SELF_UPDATE：允许面板在容器内原地更新 —— 校验 sha256 后替换
-# /usr/local/bin 下的可执行文件与 /app/ui 下的界面文件，再让进程优雅退出、
-# 由 restart 策略拉起**同一个容器**（可写层保留，刚换上去的版本随之生效）。
+# AGENT2API_SELF_UPDATE：容器内「一键更新」入口。**本镜像默认 0（关闭）**：
+# 这是自定义构建（OpenCode 提供商 + ZCode 套餐池修复 + schema v16 兼容），
+# 面板里点一次官方更新就会把全部修改覆盖掉 —— 自管镜像版本，不走原地更新。
+# （上游默认是 1；要恢复官方行为把它设回 1 即可，后果自负。）
 # 容器以 root 运行、可写层可写，这条路才成立；裸机 / systemd 部署不要设这个
 # 变量（那里退出进程等于把服务停掉，见 core/update/selfupdate.rs 的模块头）。
-# 想关掉容器内的更新入口（例如自行管理镜像版本），把它设成 0 即可。
 ENV AGENT2API_HOST=0.0.0.0 \
     AGENT2API_PROXY_HOME=/data \
     AGENT2API_UI_DIR=/app/ui \
     AGENT2API_CAPTCHA_ENABLED=1 \
-    AGENT2API_SELF_UPDATE=1
+    AGENT2API_SELF_UPDATE=0
 VOLUME ["/data"]
 EXPOSE 3065
 WORKDIR /app
