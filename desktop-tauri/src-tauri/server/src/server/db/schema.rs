@@ -180,6 +180,16 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 与上面的 `modelCatalogCache` 是两码事：那个存各家上游的**模型清单**，
     // 这个存模型的**元数据**（能力位 / 思考档位），刷新链路与失效语义各不同。
     "modelsDevCatalog",
+    // ── 下面两个保留键采自官方 v3.3.0-beta（见 SCHEMA_VERSION 的 v16 段）──
+    // 本构建没有这两个功能的读写方，登记它们只为「官方版本与本构建交替使用
+    // 同一份库」时不被配置写入误清（两边的 RESERVED 清单一致，交替才安全）。
+    // 「Agent」页的用户配置：{ clientId: [Profile] } 整份 JSON 一个键。
+    "agentProfiles",
+    // 云同步的配置与同步状态（core::cloud_sync）：整份
+    // `{provider, webdav:{…}, s3:{…}, syncPassword(信封), enabled, autoSync,
+    //   remoteRoot, profile, status:{lastSyncAt, lastSnapshotId, …}}` 一个键。
+    // 它含**远端凭据**（密文信封）且自己不能被云同步上传，属于保留键。
+    "cloudSync",
 ];
 
 /// 这个键是否属于「其它零散状态」（即不归网关配置管）。
@@ -308,9 +318,18 @@ pub fn is_reserved(key: &str) -> bool {
 /// 两条都是 `CREATE INDEX IF NOT EXISTS`（与其余版本的幂等纪律一致）：在存量库
 /// 上建索引要扫一遍表，代价与表大小成正比、只付一次；`requests` 只有几万行时
 /// 在百毫秒量级，不会让启动明显变慢。**不要把这两条往 [`V1_SCHEMA`] 里补**：
-/// 新库按 1→15 依次跑，v15 那一步同样会建出来，而 v1 里多写一份等于同一条索引
+/// 新库按 1→16 依次跑，v15 那一步同样会建出来，而 v1 里多写一份等于同一条索引
 /// 有了两处定义 —— 将来改一处忘一处，正是 `V4_SCHEMA` 那类错位的来源。
-pub const SCHEMA_VERSION: i64 = 15;
+///
+/// ── v16：为什么**本构建**要采认官方 beta 的 v16 布局（2026-10-24）────────
+/// 官方 v3.3.0-beta 起把提供商实现移出仓库（插件架构），但它的 v16 迁移是
+/// **纯增量**（新增 `assistant_sessions` 一张表 + 两个保留键，不动任何既有
+/// 表）。存量部署若用过官方 beta 的自更新（面板「加入 beta 版」/ 手动更新），
+/// 库就已经是 v16 —— 本构建若停在 v15 会被「库比程序新」的闸门拒之门外。
+/// 因此这里把 v16 的 DDL **逐字采认**（表本构建不使用，建了也只是空表），
+/// 让同一份库文件既能被官方版本打开、也能被本构建打开。**代价声明**：将来
+/// 官方出 v17 且搬动了 v16 之前的东西，这条兼容就要重新对表。
+pub const SCHEMA_VERSION: i64 = 16;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -814,6 +833,28 @@ CREATE INDEX IF NOT EXISTS idx_requests_summary ON requests(
 );
 ";
 
+/// 版本 16：AI 助手的对话会话表（schema v16）。
+///
+/// ── 逐字采自官方 v3.3.0-beta.2（本构建不使用这张表，见
+/// [`SCHEMA_VERSION`] 的 v16 段）──────────────────────────────
+/// 一条会话一行：`id`（前端生成的 UUID）、`title`（侧边栏名）、
+/// `messages`（整条消息流的 JSON 原文）、`model` / `reasoning`（会话级最后
+/// 取值）、`created_at` / `updated_at`（毫秒时间戳，侧边栏按 updated_at 倒序）。
+/// 索引只有一条 `updated_at` 倒序 —— 会话量级是几十条，前端一次全取即可。
+const V16_SCHEMA: &str = "
+-- ── assistant_sessions：AI 助手的对话会话（schema v16）───────
+CREATE TABLE IF NOT EXISTS assistant_sessions (
+  id          TEXT PRIMARY KEY,
+  title       TEXT NOT NULL DEFAULT '',
+  messages    TEXT NOT NULL DEFAULT '[]',
+  model       TEXT,
+  reasoning   TEXT,
+  created_at  INTEGER NOT NULL DEFAULT 0,
+  updated_at  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_assistant_sessions_updated ON assistant_sessions(updated_at DESC);
+";
+
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
 ///
 /// **库版本高于本程序时返回 `Err` 拒绝打开**（v14 起有意反转的一条既有决定，
@@ -901,7 +942,14 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         // 失败**不报错**：数据已经删掉了，回收空间是尽力而为的优化 —— 用户
         // 之后仍可在请求日志页的「清理」弹窗里手动压缩（那条路有后台线程与
         // 进度状态，见 `RequestStats::compact`）。
+        //
+        // VACUUM 前后各做一次 checkpoint（采自官方 beta，与
+        // `RequestStats::compact` 同形）：WAL 模式下 VACUUM 的整库重建会全部
+        // 落进 `-wal`，少了尾部那次截零，空间只是从主库搬到 WAL、总占用不降
+        // 反升（issue #297）。
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         let _ = conn.execute_batch("VACUUM;");
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     }
     Ok(())
 }
@@ -971,6 +1019,10 @@ fn apply_version(
         // v15：requests 补两条索引（status 的定位 + 报表窄列的覆盖，见
         // V15_SCHEMA 与 SCHEMA_VERSION 的 v15 段）。
         15 => conn.execute_batch(V15_SCHEMA),
+        // v16：assistant_sessions 助手对话会话表（逐字采自官方 beta，见
+        // V16_SCHEMA 与 SCHEMA_VERSION 的 v16 段）。新表用 CREATE IF NOT
+        // EXISTS，幂等。
+        16 => conn.execute_batch(V16_SCHEMA),
         _ => Ok(()),
     }
 }
