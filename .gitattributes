@@ -1,0 +1,4 @@
+# Rust 源码统一 LF：仓库里的 .rs 都是 LF，而 Windows 上 core.autocrlf=true 会在
+# 提交时转 CRLF，导致改一行也出现全文件 diff（review 时看不清真实改动）。
+# 这里按类型钉死 eol=lf，让工作区、索引、远端三者一致。
+*.rs text eol=lf
