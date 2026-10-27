@@ -953,6 +953,32 @@ fn normalize_command(command: &str) -> String {
 ///
 /// 用于判断「整段就是一个被围栏包起来的信封」：此时围栏开头那行不该被当成
 /// 可见正文（否则用户会看到孤零零一行 ```json）。
+/// 去掉 head 尾部残留的围栏开头（```json / ```）。
+///
+/// ── 为什么需要它（2026-10-27 实测）────────────────────────────
+/// 上游常把信封包在围栏里：
+///     你说得对……再做完整评估。\n```json\n{"action":"ask",...}
+/// 截断点是那个 `{`，于是 head 剩下「正文 + 一行 ```json」。用户看到的
+/// 最后一行就是孤零零的 ```json（图一的实际症状）—— 那是信封的壳，
+/// 不是模型想说的话。
+fn strip_trailing_fence_opener(head: &str) -> &str {
+    let trimmed = head.trim_end();
+    let Some(last_line_start) = trimmed.rfind('\n') else {
+        // 只有一行：它自己就是围栏开头才剥（否则是正常正文）
+        return if trimmed.starts_with("```") && !trimmed[3..].contains('\n') {
+            ""
+        } else {
+            trimmed
+        };
+    };
+    let last_line = &trimmed[last_line_start + 1..];
+    if last_line.starts_with("```") && !last_line[3..].contains('\n') {
+        trimmed[..last_line_start].trim_end()
+    } else {
+        trimmed
+    }
+}
+
 fn is_only_fence_opener(head: &str) -> bool {
     let trimmed = head.trim();
     if trimmed.is_empty() {
@@ -1201,7 +1227,8 @@ pub fn parse_extracted_tools(content: &str) -> (String, Vec<ParsedToolCall>) {
             if is_only_fence_opener(head) {
                 String::new()
             } else {
-                head.to_string()
+                // 剥掉尾部残留的围栏开头（信封的壳，不是人话）
+                strip_trailing_fence_opener(head).to_string()
             }
         }
         None => content.to_string(),
@@ -1719,7 +1746,13 @@ async fn pump(
             }
         }
     }
-    stream.saw_end = true;
+    // ── 这里**不能**无条件设 saw_end（2026-10-27 实测事故）────────
+    // saw_end 的语义是「上游给了 [DONE]，这条流已收尾」。pump 的循环结束
+    // 只说明**连接**断了，不等于上游收尾；更要命的是 ask 自动确认会**复用**
+    // 这个 pump 跑第二轮 —— 一旦在这里置位，第二轮 feed() 第一行的
+    // `if self.saw_end { return Vec::new() }` 会把第二轮内容整个吞掉。
+    // 实测症状：正文只剩第一轮那半句、usage 估成 0、用户看到「说了一句就停」。
+    // 收尾标志由调用方（drive_stream / aggregate）在真正收尾时设置。
     Ok(())
 }
 
@@ -1757,8 +1790,20 @@ async fn auto_confirm_round(
     )
     .await?;
 
+    // ── 必须重置 saw_end（2026-10-27 实测事故的第二个入口）────────
+    // 第一轮以 action=ask 收尾时，上游照样会发 [DONE]，而 feed() 收到
+    // OrcaEvent::Done 就会把 saw_end 置位 —— 下一轮 feed() 第一行直接
+    // `return Vec::new()`，第二轮内容一个字节都流不出来。所以这里必须清掉。
+    //
+    // 顺带清 last_error：第一轮如果带过流内错误，不该污染第二轮的判定。
+    // scanner 的残余缓冲一并清空 —— 第一轮的 [DONE] 之后可能还剩半行没凑成
+    // `\n\n`，留着会把第二轮的字节错拼进上一帧。
+    stream.saw_end = false;
+    stream.saw_error = false;
+    stream.last_error = None;
+    stream.scanner = SseScanner::default();
+
     // 第二轮同样走 pump：内容进同一个 stream，正文帧继续实时下发。
-    // 注意**不**重置 saw_end —— 那是「这条客户端流已经收尾」的标志。
     let round_start = stream.content.len();
     pump(response, stream, Some(sender)).await?;
 
@@ -1859,6 +1904,8 @@ async fn drive_stream(
         }
     }
 
+    // 真正收尾：pump 已不再置 saw_end（见那里的说明），标志在这里落定
+    stream.saw_end = true;
     let finish_reason = if stream.saw_error { None } else { Some("stop") };
     for frame in stream.finalize(finish_reason) {
         send_frame(sender, &frame).await?;
@@ -1930,6 +1977,11 @@ async fn aggregate(
             match confirmed {
                 Ok(next) => {
                     // 第二轮流完再收尾（失败不阻断：正文已在，手动确认仍可用）
+                    // 与流式路径同一条口径：重置收尾标志，否则第二轮被 feed() 吞掉
+                    stream.saw_end = false;
+                    stream.saw_error = false;
+                    stream.last_error = None;
+                    stream.scanner = SseScanner::default();
                     if let Err(error) = pump(next, &mut stream, None).await {
                         crate::server::logging::verbose(
                             "[OrcaTerm]",
@@ -1954,6 +2006,8 @@ async fn aggregate(
             }
         }
     }
+
+    stream.saw_end = true;
 
     // 上游不给 usage：本地估算后上报（口径见 estimate_orcaterm_usage 的说明）
     telemetry.report_usage(&estimate_orcaterm_usage(prompt, &stream.content));
@@ -2624,5 +2678,55 @@ mod tests {
             "tools": [{"function": {"name": "run_code"}}]
         });
         assert!(is_agentic_request(&agent));
+    }
+    // ── 2026-10-27 实测事故回归：第二轮被吞、尾部围栏残留 ──────────
+
+    #[test]
+    fn pump_no_longer_sets_saw_end_so_second_round_flows() {
+        // 事故形态：第一轮 [DONE] 之后 saw_end 置位，第二轮 feed() 直接返回空
+        let mut stream = OrcaStream::new("m", vec![]);
+        stream.content = "第一轮正文".to_string();
+        stream.emitted_bytes = "第一轮正文".len();
+        stream.saw_end = true; // 第一轮正常收尾
+
+        // 模拟 auto_confirm_round 的重置
+        stream.saw_end = false;
+        stream.saw_error = false;
+        stream.last_error = None;
+        stream.scanner = SseScanner::default();
+
+        // 第二轮 SSE 帧：必须能流出来
+        let sse = "data: {\"type\":\"ai\",\"content\":\"第二轮内容\"}\n\ndata: [DONE]\n\n";
+        let frames = stream.feed(sse);
+        assert!(!frames.is_empty(), "第二轮必须有帧下发（旧实现这里是空的）");
+        assert!(stream.content.contains("第二轮内容"), "第二轮内容必须进 content");
+    }
+
+    #[test]
+    fn trailing_fence_opener_is_stripped_from_head() {
+        // 图一实际症状：正文尾部残留一行 fence+json
+        let head = "你说得对，我之前分析不够深入。\n```json";
+        assert_eq!(
+            strip_trailing_fence_opener(head),
+            "你说得对，我之前分析不够深入。",
+            "信封的围栏壳不能留在正文里"
+        );
+    }
+
+    #[test]
+    fn trailing_fence_strip_keeps_normal_text() {
+        // 正常正文不能被误剥
+        assert_eq!(strip_trailing_fence_opener("正常结尾。"), "正常结尾。");
+    }
+
+    #[test]
+    fn fenced_ask_envelope_leaves_clean_prose() {
+        // 完整链路：正文 + 围栏包着的 ask 信封 → 正文里不该有 fence 或 json
+        let raw = "你说得对，我之前分析不够深入。\n```json\n{\"action\":\"ask\",\"question\":\"要继续吗\"}";
+        let (clean, tools) = parse_extracted_tools(raw);
+        assert!(tools.is_empty());
+        assert!(!clean.contains("```"), "围栏壳不能留在正文: {clean:?}");
+        assert!(!clean.contains("json"), "语言标识不能留在正文: {clean:?}");
+        assert!(clean.contains("分析不够深入"), "正文必须保留: {clean:?}");
     }
 }
