@@ -37,7 +37,7 @@
   flex: 1 1 320px;
   min-width: 0;
   color: var(--text-2);
-  font-size: 11.5px;
+  font-size: var(--text-xs);
   line-height: 1.7;
 }
 
@@ -73,11 +73,11 @@
 
 /* 用 span 而不是 h3：卡片正文里的 Markdown 标题已占用 h3~h6，
    这里再插一个同级标题会让大纲层级与视觉层级打结 */
-.update-log-title { color: var(--text); font-size: 12.5px; font-weight: 650; }
+.update-log-title { color: var(--text); font-size: var(--text-sm); font-weight: 650; }
 
 .update-log-meta {
   color: var(--text-3);
-  font-size: 11.5px;
+  font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
 }
 
@@ -93,7 +93,7 @@
 /* 加载中 / 空态 / 失败态的统一文案块：与面板既有的 .detail 一个观感 */
 .update-log-hint {
   color: var(--text-2);
-  font-size: 11.5px;
+  font-size: var(--text-xs);
   line-height: 1.7;
   word-break: break-word;
 }
@@ -131,7 +131,7 @@
 /* 版本号：等宽字体 + 表格数字，与面板里其它版本号读数同一套写法 */
 .rel-tag {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--text-sm);
   font-weight: 650;
   color: var(--text);
   font-variant-numeric: tabular-nums;
@@ -140,7 +140,7 @@
 .rel-date {
   margin-left: auto;      /* 靠右，与卡头左端的版本号分列两端 */
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
@@ -171,7 +171,7 @@
 
 .rel-foot a {
   color: var(--primary-fg);
-  font-size: 11.5px;
+  font-size: var(--text-xs);
   font-weight: 600;
   text-decoration: none;
 }
@@ -198,11 +198,11 @@
 
 .qq-no .k {
   color: var(--text-3);
-  font-size: 11.5px;
+  font-size: var(--text-xs);
 }
 
 .qq-no code {
-  font-size: 13.5px;
+  font-size: var(--text-base);
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.02em;
@@ -211,7 +211,7 @@
 .qq-hint {
   margin: 0;
   color: var(--text-3);
-  font-size: 11.5px;
+  font-size: var(--text-xs);
   line-height: 1.6;
 }
 
@@ -219,7 +219,7 @@
    作用域收在 .md-body 里，不污染面板上其它文字。 */
 .md-body {
   color: var(--text-2);
-  font-size: 12px;
+  font-size: var(--text-sm);
   line-height: 1.75;
   word-break: break-word;
 }
@@ -235,10 +235,10 @@
   margin: 14px 0 6px;
 }
 
-.md-body h3.md-h { font-size: 13px; }
-.md-body h4.md-h { font-size: 12.5px; }
+.md-body h3.md-h { font-size: var(--text-base); }
+.md-body h4.md-h { font-size: var(--text-sm); }
 .md-body h5.md-h,
-.md-body h6.md-h { font-size: 12px; color: var(--text-2); }
+.md-body h6.md-h { font-size: var(--text-sm); color: var(--text-2); }
 
 .md-body p { margin: 7px 0; }
 
@@ -259,7 +259,7 @@
   background: var(--surface-3);
   color: var(--text);
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: var(--text-xs);
 }
 
 /* 代码块：内容原样保留（不折行），超出横向滚动 */
@@ -278,7 +278,7 @@
   background: transparent;
   color: var(--text-2);
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: var(--text-xs);
   line-height: 1.6;
   white-space: pre;
 }
@@ -296,7 +296,7 @@
 .md-body .md-table {
   margin: 8px 0;
   border-collapse: collapse;
-  font-size: 12px;
+  font-size: var(--text-sm);
 }
 
 .md-body .md-table th,

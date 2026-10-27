@@ -393,6 +393,43 @@ impl AccountStore {
                     "chatSupported".to_string(),
                     Value::Bool(forwards_requests(record)),
                 );
+                // 凭证探针结论（B 方案）：`valid` / `invalid` / `unknown`，
+                // 外加 `probeAt`（上次检测时刻，0 = 从未检测）与 `probeReason`。
+                //
+                // ── 为什么恒有这三个键 ──────────────────────────────
+                // 界面要区分「没测过」与「测过且有效」——两者都是「能用」但含义
+                // 完全不同（前者是未知，后者是已验证）。缺键会让前端只能猜，
+                // 而猜错的代价是把未检测的账号当成健康的。所以未知态显式给
+                // `unknown`，与「检测了但问不到」共用同一个值（都不可下结论）。
+                //
+                // 读的是缓存（`credential_maintenance::probe_cache`），不是现场探针：
+                // 列表接口必须是瞬时的，探针要打上游，只在用户点「全部检测」时才跑。
+                {
+                    let cache = crate::server::core::credential_maintenance::probe_cache();
+                    let entry = cache.get(record.id());
+                    fields.insert(
+                        "probeStatus".to_string(),
+                        entry
+                            .and_then(|item| item.get("status"))
+                            .cloned()
+                            .unwrap_or_else(|| json!("unknown")),
+                    );
+                    fields.insert(
+                        "probeAt".to_string(),
+                        Value::from(
+                            entry
+                                .and_then(|item| item.get("at"))
+                                .and_then(Value::as_i64)
+                                .unwrap_or(0),
+                        ),
+                    );
+                    if let Some(reason) = entry
+                        .and_then(|item| item.get("reason"))
+                        .and_then(Value::as_str)
+                    {
+                        fields.insert("probeReason".to_string(), json!(reason));
+                    }
+                }
                 // 最近一次签到成功的时刻（0 = 从未签过）。跨家统一注入的理由与上面
                 // 两条相同：它是「这条账号的签到状态」这一个事实，各家的存放位置
                 // 一致（`checkinAt`），界面不必按 provider 查表。

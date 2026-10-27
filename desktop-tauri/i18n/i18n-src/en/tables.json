@@ -23,5 +23,8 @@
   "跳转到第 1–{pageCount} 页": "Go to page 1–{pageCount}",
   "这一列已隐藏": "This column is hidden",
   "这一列正在显示": "This column is visible",
-  "页": "page"
+  "页": "page",
+  "舒适": "Cozy",
+  "紧凑": "Compact",
+  "表格行距：点击在紧凑与舒适之间切换（所有表格一起生效）": "Table row spacing: click to switch between compact and cozy (applies to all tables)"
 }

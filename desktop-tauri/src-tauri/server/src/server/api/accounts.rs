@@ -370,6 +370,16 @@ pub async fn dispatch(
         ("POST", "reorder") => return reorder_accounts(&state, body).await,
         ("POST", "refresh") => return refresh_account(&state, body).await,
         ("POST", "refresh-expiring") => return refresh_expiring_accounts(&state).await,
+        // 凭证探针（B 方案）：`?id=` 单账号、无参批量。逐个真打上游轻量接口，
+        // 结论落缓存，账号列表据此显示有效/失效/未检测。
+        ("POST", "probe") => {
+            let only = query_param(query, "id");
+            return probe_accounts(&state, only.as_deref()).await;
+        }
+        // 上次探针结论的只读快照（账号页首屏用它先画状态，不用等真跑）
+        ("GET", "probe/snapshot") => {
+            return ok_json(crate::server::core::credential_maintenance::probe_cache())
+        }
         // 余额 / 积分查询（四家混查）实现在 `api::accounts_usage`（拆分见那里的模块头）。
         // `?id=` 是「手点某一行积分按钮」的单查形态，语义见 accounts_usage 的说明。
         ("GET", "usage") => {
@@ -1629,6 +1639,20 @@ pub async fn refresh_expiring_accounts(state: &ServerState) -> Response {
     // 这一轮已经真刷过一遍了：把定时维护的排期顺延一个间隔（口径与其它手动
     // 入口一致）—— 否则「刚点完维护、到点或重启后又立刻再刷一遍」。
     crate::server::core::credential_maintenance::note_manual_run();
+    ok_json(report)
+}
+
+/// POST /api/accounts/probe —— 凭证探针（B 方案）。
+///
+/// 逐个账号真打一次上游的**只读轻量接口**，回答「上游认不认这枚 token」。
+/// 与 `refresh-expiring` 的分工：那条是「把临期的续掉」，这条是「把无效的查出来」。
+///
+/// 串行执行（不并发）：与签到同一理由 —— 多账号同时打上游容易触发风控。
+/// 因此账号多时这条会慢（每账号一个往返），前端应显示进度而不是当成瞬时接口。
+async fn probe_accounts(state: &ServerState, only_id: Option<&str>) -> Response {
+    let report =
+        crate::server::core::credential_maintenance::probe_accounts_report(state.store(), only_id)
+            .await;
     ok_json(report)
 }
 

@@ -65,7 +65,7 @@
   .crumb { overflow: hidden; white-space: nowrap; min-width: 0; }
   .crumb > span:not(.cur),
   .crumb .sep { display: none; }
-  .crumb .cur { font-size: 14px; }
+  .crumb .cur { font-size: var(--text-base); }
 }
 
 /* ═══ 侧边栏抽屉化（纯 CSS，#nav-toggle 驱动） ═══ */
@@ -279,7 +279,7 @@
   }
   .acct-table td::before, .models-table td::before {
     content: attr(data-col);
-    font-size: 10px;
+    font-size: var(--text-2xs);
     font-weight: 600;
     letter-spacing: .04em;
     text-transform: uppercase;
@@ -323,7 +323,7 @@
   }
   .models-table tr.tr-group td {
     display: block;
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     font-weight: 600;
     color: var(--text-2);
     text-transform: uppercase;
@@ -460,7 +460,7 @@
   .req-row > span::before {
     content: attr(data-col);
     flex: 0 0 40px;
-    font-size: 10.5px;
+    font-size: var(--text-2xs);
     font-weight: 600;
     letter-spacing: .03em;
     color: var(--text-3);
@@ -693,7 +693,7 @@
   /* 账号名第一行、签到状态跟在右侧；时间第二行整行；操作按钮第二行右端 */
   .ck-table td:nth-child(1) { grid-column: 1; grid-row: 1; font-weight: 600; overflow-wrap: anywhere; }
   .ck-table td:nth-child(2) { grid-column: 2; grid-row: 1; justify-self: end; }
-  .ck-table td:nth-child(3) { grid-column: 1 / -1; grid-row: 2; font-size: 11.5px; }
+  .ck-table td:nth-child(3) { grid-column: 1 / -1; grid-row: 2; font-size: var(--text-xs); }
   .ck-table td:nth-child(4) {
     grid-column: 2;
     grid-row: 2;

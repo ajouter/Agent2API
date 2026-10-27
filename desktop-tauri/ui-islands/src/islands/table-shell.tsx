@@ -1,5 +1,6 @@
 import * as React from 'react'
 import {
+  Button,
   Input,
   Pager,
   Select,
@@ -9,6 +10,51 @@ import {
   SelectValue,
 } from '@ui'
 import { t } from '../i18n'
+
+/* ─── 表格密度（全局）：table-shell 页脚的开关切 body[data-density] ───
+   cozy 档放宽走 --table-cell-pad 变量的表的行距（见 components.css）。
+   localStorage 记忆（workbuddy-desktop-table-density），模块加载即应用，
+   刷新后保持。默认 compact（不设属性）。 */
+const DENSITY_KEY = 'workbuddy-desktop-table-density'
+type Density = 'cozy' | 'compact'
+
+function readDensity(): Density {
+  try {
+    return localStorage.getItem(DENSITY_KEY) === 'cozy' ? 'cozy' : 'compact'
+  } catch {
+    return 'compact'
+  }
+}
+
+function applyDensity(value: Density): void {
+  try {
+    localStorage.setItem(DENSITY_KEY, value)
+  } catch { /* 隐私模式：留在内存即可 */ }
+  if (value === 'cozy') document.body.dataset.density = 'cozy'
+  else delete document.body.dataset.density
+}
+
+applyDensity(readDensity())
+
+/** 密度开关（页脚里的一枚文字钮）：显示当前档位，点击切换。五张表共用一个全局值 */
+function DensityToggle({ disabled }: { disabled?: boolean }) {
+  const [density, setDensity] = React.useState<Density>(() => readDensity())
+  return (
+    <Button
+      variant='ghost'
+      className='h-[26px] px-2 text-xs'
+      disabled={disabled}
+      title={t('表格行距：点击在紧凑与舒适之间切换（所有表格一起生效）')}
+      onClick={() => {
+        const next: Density = density === 'cozy' ? 'compact' : 'cozy'
+        setDensity(next)
+        applyDensity(next)
+      }}
+    >
+      {density === 'cozy' ? t('舒适') : t('紧凑')}
+    </Button>
+  )
+}
 
 /**
  * Agent2API · **通用表格外壳**：统一的页脚分页栏 + 客户端分页状态。
@@ -265,6 +311,9 @@ function TableFooter({
             onBlur={commit}
           />
           {t('页')}
+        </span>
+        <span className='table-foot-density'>
+          <DensityToggle disabled={disabled} />
         </span>
         <Pager page={page} pageCount={pageCount} onPageChange={onPageChange} disabled={disabled} />
       </div>

@@ -51,7 +51,8 @@ use crate::server::core::upstream::request::{new_conversation_id, new_message_id
 use crate::server::errors::GatewayError;
 
 use super::super::adapter::{
-    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, RetryAdvice, UpstreamErrorClass,
+    AccountProbe, ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, RetryAdvice,
+    UpstreamErrorClass,
 };
 use super::super::content_block;
 use super::super::ProviderKind;
@@ -525,6 +526,54 @@ impl ProviderAdapter for WorkBuddyAdapter {
     }
 
     /// workbuddy 有积分概念（腾讯计费接口，改造前唯一有的一家）。
+    /// 凭证探针：调一次**只读的积分/用量查询**来判断上游认不认这枚 token。
+    ///
+    /// ── 为什么选这个接口 ──────────────────────────────────────
+    /// 它是本家最轻的只读接口（`get_personal_usage` 一类），**不消耗额度、
+    /// 不产生会话、不改任何状态**，且鉴权链与真实转发完全一致 —— 上游认它
+    /// 就等于认这枚 token。比"发一条最小 chat 请求"安全得多（后者会真扣费）。
+    ///
+    /// ── 三态怎么判 ────────────────────────────────────────────
+    /// · 成功 → `Valid`；
+    /// · `TokenExpired` / 401 / 403 → `Invalid`（凭证类失败，上游明确拒绝）；
+    /// · 其余（网络错误、超时、代理不通、5xx）→ `Unknown` —— 用户网络问题
+    ///   不等于账号坏了，误标失效会让人白白删掉好账号。
+    fn probe_account<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AccountProbe> + Send + 'a>> {
+        Box::pin(async move {
+        let Some(entry) = store.get_session_by_id(account_id) else {
+            return AccountProbe::invalid("该账号没有可用凭证");
+        };
+        let billing = crate::server::core::billing::BillingService::new(
+            AuthService::for_store(store.clone()),
+        );
+        match billing.query_usage(Some(&entry.session), None).await {
+            Ok(_) => AccountProbe::valid(),
+            Err(error) => {
+                let gateway = error.to_gateway_error();
+                match gateway.status_code {
+                    // 凭证类失败：上游明确说这枚 token 不认
+                    401 | 403 => AccountProbe::invalid(gateway.message),
+                    _ => {
+                        // 业务错误码里也可能藏着凭证失效（上游习惯 200 + code）
+                        if gateway.message.contains("token")
+                            || gateway.message.contains("登录")
+                            || gateway.message.contains("授权")
+                        {
+                            AccountProbe::invalid(gateway.message)
+                        } else {
+                            AccountProbe::unknown(gateway.message)
+                        }
+                    }
+                }
+            }
+        }
+        })
+    }
+
     fn supports_usage(&self) -> bool {
         true
     }

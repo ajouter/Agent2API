@@ -264,3 +264,142 @@ pub fn note_manual_run() {
         logging::verbose("[Accounts]", &format!("凭证维护排期顺延失败：{error}"));
     }
 }
+
+
+// ─── 凭证探针（B 方案：账号列表的有效性状态）─────────────────
+
+/// 探针结果在账号列表里的缓存键（`kv` 表）。
+///
+/// ── 为什么要落库而不是只放内存 ──────────────────────────────
+/// 探针要打上游（每个账号一个请求），不能每次打开账号页都跑一遍。
+/// 落库后：面板一打开就能看到上次检测的结论，重启也不会全变成"未检测"。
+const KV_PROBE_KEY: &str = "accountProbe";
+
+/// 一次批量探针的结果报告。
+///
+/// `results` 与账号列表**同序**（按 `list_accounts` 的顺序逐条给），
+/// 界面上逐行对照时不用再按 id 重排 —— 与 `refresh_expiring_report` 同一取舍。
+pub async fn probe_accounts_report(store: &AccountStore, only_id: Option<&str>) -> Value {
+    let snapshot = store.list_accounts();
+    let accounts: Vec<Value> = snapshot
+        .get("accounts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    // 串行探针：与签到同一理由 —— 多账号并发打上游容易触发风控。
+    // 单账号探针（only_id）就是用户手点某一行，不涉及批量。
+    let mut results: Vec<Value> = Vec::new();
+    let mut valid = 0usize;
+    let mut invalid = 0usize;
+    let mut unknown = 0usize;
+
+    for account in &accounts {
+        let id = account.get("id").and_then(Value::as_str).unwrap_or("");
+        if id.is_empty() {
+            continue;
+        }
+        if let Some(only) = only_id {
+            if id != only {
+                continue;
+            }
+        }
+        let provider = account
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        let Some(kind) = kind_from_id(provider) else {
+            results.push(json!({
+                "id": id,
+                "provider": provider,
+                "status": "unknown",
+                "reason": "未注册的提供商",
+            }));
+            unknown += 1;
+            continue;
+        };
+        // 没有凭证的账号（纯桌面端实时读）不探：探针要读 store 里的 token，
+        // 这类账号的凭证不在库里，问了只会得到「没有可用凭证」的假失效。
+        if !account
+            .get("hasCredentials")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            results.push(json!({
+                "id": id,
+                "provider": provider,
+                "status": "unknown",
+                "reason": "该账号不落库凭证（实时读本机客户端），无法探测",
+            }));
+            unknown += 1;
+            continue;
+        }
+
+        let adapter = adapter_for(kind);
+        let probe = adapter.probe_account(store, id).await;
+        match probe.status() {
+            "valid" => valid += 1,
+            "invalid" => invalid += 1,
+            _ => unknown += 1,
+        }
+        let mut item = json!({
+            "id": id,
+            "provider": provider,
+            "status": probe.status(),
+        });
+        if let Some(reason) = probe.reason() {
+            if let Some(object) = item.as_object_mut() {
+                object.insert("reason".to_string(), json!(reason));
+            }
+        }
+        results.push(item);
+    }
+
+    // 结论落库（覆盖式）：下次打开账号页直接读，不用重跑
+    save_probe_cache(store, &results);
+
+    json!({
+        "results": results,
+        "valid": valid,
+        "invalid": invalid,
+        "unknown": unknown,
+        "total": valid + invalid + unknown,
+    })
+}
+
+/// 读上次的探针缓存（`id → {status, reason, at}`）。
+///
+/// 账号页首次渲染用它把状态先画出来，用户点「全部检测」才真跑一遍。
+/// 复用 `task_state` 的 kv 通道（同一张表的 `value` 槽），不另开直连。
+pub fn probe_cache() -> Value {
+    crate::server::core::task_state::read(KV_PROBE_KEY)
+        .ok()
+        .and_then(|state| state.value)
+        .unwrap_or_else(|| json!({}))
+}
+
+/// 写探针缓存（合并式：本次没探到的账号保留上次结论）。
+fn save_probe_cache(_store: &AccountStore, results: &[Value]) {
+    let mut cache = probe_cache();
+    let Some(map) = cache.as_object_mut() else {
+        return;
+    };
+    let at = crate::server::logging::now_ms();
+    for item in results {
+        let Some(id) = item.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let mut entry = json!({
+            "status": item.get("status").cloned().unwrap_or(json!("unknown")),
+            "at": at,
+        });
+        if let Some(reason) = item.get("reason") {
+            if let Some(object) = entry.as_object_mut() {
+                object.insert("reason".to_string(), reason.clone());
+            }
+        }
+        map.insert(id.to_string(), entry);
+    }
+    let _ = crate::server::core::task_state::store_value(KV_PROBE_KEY, cache);
+}

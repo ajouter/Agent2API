@@ -23,8 +23,9 @@ use super::clock::{date_key, day_of, local_midnight_ms};
 use super::record::{DailyEntry, RequestEntry};
 use super::report::{
     build_accounts, build_models, build_providers, build_top_model, cache_rates, cache_trend_24h,
-    daily_trend, heatmap, model_stat_key, normalize_range, push_account_accum, push_model_accum,
-    push_provider_accum, range_bounds, range_totals, streak, SummaryRow,
+    daily_trend, heatmap, model_stat_key, normalize_range, previous_bounds,
+    push_account_accum, push_model_accum, push_provider_accum, range_bounds, range_totals, streak,
+    RangeUsage, SummaryRow,
 };
 use super::{daily, sql};
 use super::legacy;
@@ -143,6 +144,7 @@ pub(super) fn summarize(
     daily: &BTreeMap<String, DailyEntry>,
     cache_totals: &[(i64, i64)],
     entries: &[SummaryRow],
+    usage: &RangeUsage,
     range: &str,
     now: i64,
     custom: Option<(NaiveDate, NaiveDate)>,
@@ -164,7 +166,18 @@ pub(super) fn summarize(
     // models 同样与 topModel 同源（`topModel` 就是这张表的冠军）：
     // 报表的「模型用量」环形图读它，各扇区之和等于 overview.tokens
     let models = build_models(&totals.model_totals);
-    let trend = daily_trend(daily, &start_date, &end_date);
+    let trend = daily_trend(daily, &start_date, &end_date, &usage.per_day);
+    // 较上周期：等长前期（RANGE_ALL 恒 None，前端据此隐藏对比角标）。
+    // range_totals 的同函数复跑 —— 同源同口径，「上一周期」的数才与本期可比。
+    let previous = previous_bounds(&start_date, &end_date, range)
+        .map(|(prev_start, prev_end)| {
+            let totals = range_totals(daily, &prev_start, &prev_end);
+            json!({
+                "requests": totals.requests,
+                "successful": totals.successful,
+                "tokens": totals.tokens,
+            })
+        });
     let map = heatmap(daily, now_day);
     let consecutive = streak(daily, now_day);
 
@@ -180,11 +193,20 @@ pub(super) fn summarize(
         "overview": {
             "requests": totals.requests,
             "successful": totals.successful,
+            "failed": totals.requests - totals.successful,
             "tokens": totals.tokens,
+            "promptTokens": usage.prompt_tokens,
+            "completionTokens": usage.completion_tokens,
+            "cacheTokens": totals.cache_hit_tokens,
+            "cacheInputTokens": totals.cache_input_tokens,
+            "p95Ms": usage.p95_ms,
             "activeDays": totals.active_days,
             "streak": consecutive,
             "topModel": top_model,
         },
+        // 等长前期的总量（较上周期对比；RANGE_ALL 是 null）。字段名照搬
+        // overview 的子集，前端按「存在才渲染角标」消费（新增字段不改既有契约）
+        "previous": previous,
         // 按 provider 维度的区间汇总（**新增字段，不改既有字段**）。
         // 前端按「存在则展示、缺失则隐藏」消费，所以旧前端拿到它只会忽略。
         // 恒为数组（无数据时是空数组而不是 null）：前端不必判两种空形态

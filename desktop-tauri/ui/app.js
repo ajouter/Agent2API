@@ -988,3 +988,87 @@ function pollUpdateStatus() {
 }
 
 setTimeout(pollUpdateStatus, updatePollDelay);
+
+/* ─── Ctrl+K 页面速搜 ─────────────────────────────────────────
+   开发者工具的标配：键盘直达任意页面。输入过滤中文名 / 内部键，↑↓ 选择、
+   回车跳转、Esc 关闭、点击遮罩关闭。样式见 layout.css 的 .page-search 段。
+   PAGE_LABELS / showPage 是本脚本顶层的既有声明，同作用域直接可用。
+   字符串一律单双引号拼接（不用模板字面量）：本块由脚本注入，模板字面量的
+   反引号在注入管道里要转义两次，为了省一层转义在这里改拼接。 */
+(() => {
+  const overlay = document.createElement('div');
+  overlay.className = 'page-search';
+  overlay.hidden = true;
+  overlay.innerHTML =
+    '<div class="page-search-box">' +
+      '<input class="page-search-input" type="text" placeholder="' + wbI18n.t('搜索页面…') + '"' +
+             ' aria-label="' + wbI18n.t('搜索页面') + '" />' +
+      '<div class="page-search-list" role="listbox"></div>' +
+    '</div>';
+  document.body.appendChild(overlay);
+
+  const input = overlay.querySelector('.page-search-input');
+  const list = overlay.querySelector('.page-search-list');
+  let active = 0;
+  let items = [];
+
+  function render(filter) {
+    const query = (filter || '').trim().toLowerCase();
+    items = Object.entries(PAGE_LABELS).filter(([key, label]) =>
+      !query || key.includes(query) || String(label).toLowerCase().includes(query));
+    list.innerHTML = items.map(([key, label], i) =>
+      '<button type="button" role="option" data-page="' + key + '" class="' + (i === active ? 'active' : '') + '">' +
+        '<span>' + label + '</span><span class="page-search-key">' + key + '</span>' +
+      '</button>').join('')
+      || '<div class="page-search-empty">' + wbI18n.t('没有匹配的页面') + '</div>';
+  }
+
+  function openSearch() {
+    overlay.hidden = false;
+    input.value = '';
+    render('');
+    active = 0;
+    input.focus();
+  }
+
+  function closeSearch() {
+    overlay.hidden = true;
+  }
+
+  function move(step) {
+    if (!items.length) return;
+    active = (active + step + items.length) % items.length;
+    render(input.value);
+    list.querySelector('button.active')?.scrollIntoView({ block: 'nearest' });
+  }
+
+  function go(key) {
+    if (!PAGE_LABELS[key]) return;
+    closeSearch();
+    showPage(key);
+  }
+
+  document.addEventListener('keydown', event => {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+      event.preventDefault();
+      overlay.hidden ? openSearch() : closeSearch();
+      return;
+    }
+    if (overlay.hidden) return;
+    if (event.key === 'Escape') { event.preventDefault(); closeSearch(); }
+  });
+
+  input.addEventListener('input', () => { active = 0; render(input.value); });
+  input.addEventListener('keydown', event => {
+    if (event.key === 'ArrowDown') { event.preventDefault(); move(1); }
+    else if (event.key === 'ArrowUp') { event.preventDefault(); move(-1); }
+    else if (event.key === 'Enter') { event.preventDefault(); go(items[active]?.[0]); }
+  });
+  list.addEventListener('click', event => {
+    const button = event.target.closest('button[data-page]');
+    if (button) go(button.dataset.page);
+  });
+  overlay.addEventListener('mousedown', event => {
+    if (event.target === overlay) closeSearch();
+  });
+})();

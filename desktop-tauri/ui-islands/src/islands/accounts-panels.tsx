@@ -232,6 +232,59 @@ export function StatusCell({ account }: { account: AccountRecord }) {
   )
 }
 
+/* ─── 凭证探针列（B 方案）──────────────────── */
+
+/**
+ * 凭证：这个账号的 token 此刻**上游认不认**。
+ *
+ * ── 为什么需要这一列 ────────────────────────────────────────
+ * 改造前账号失效只能等真实转发失败一次才知道（401 才触发懒刷新），于是账号池里
+ * 混着死号、界面完全看不出来、选路时照样轮询到它们。这一列把「有效性」变成一个
+ * 看得见的事实。
+ *
+ * ── 三态而不是布尔 ──────────────────────────────────────────
+ * 灰（未检测 / 问不到）是**必需的第三态**：网络超时、代理不通、该家没实现探针
+ * 都归这里。把「问不到」画成红点会让人误删好账号，画成绿点又会让坏账号继续
+ * 留在池子里。悬停说明写清楚是哪一种，用户自己判断。
+ *
+ * 颜色只在「上游明确拒绝」时出红 —— 与 StatusCell 的克制口径一致。
+ */
+export function ProbeCell({ account }: { account: AccountRecord }) {
+  const status = String((account as Record<string, unknown>).probeStatus ?? 'unknown')
+  const at = Number((account as Record<string, unknown>).probeAt ?? 0)
+  const reason = String((account as Record<string, unknown>).probeReason ?? '')
+
+  // 没有凭证的账号探不了（探针要读库里的 token），如实说而不是画个灰点让人以为没测
+  const hasCredentials = account.hasCredentials !== false
+  const kind = !hasCredentials ? 'none' : status === 'valid' ? 'ok' : status === 'invalid' ? 'bad' : 'unknown'
+
+  const label = kind === 'ok' ? t('有效') : kind === 'bad' ? t('失效') : kind === 'none' ? t('无凭证') : t('未检测')
+  const when = at > 0 ? t(' · {time}', { time: formatProbeTime(at) }) : ''
+  const detail = reason ? t('（{reason}）', { reason }) : ''
+  const title = kind === 'ok'
+    ? t('上游已确认该凭证可用{when}', { when })
+    : kind === 'bad'
+      ? t('上游明确拒绝该凭证{when}{detail}。可点操作列的「刷新 Token」续期，或重新添加账号', { when, detail })
+      : kind === 'none'
+        ? t('该账号不落库凭证（实时读本机客户端），无法探测')
+        : t('尚未检测，或上次检测问不到结果{when}{detail}', { when, detail })
+
+  return (
+    <span className={'probe-dot is-' + kind} data-tip={title} title={title}>
+      <i aria-hidden='true' />
+      <em>{label}</em>
+    </span>
+  )
+}
+
+/** 探针时刻的短格式（本地时间 `MM-DD HH:MM`）：绝对时间比「3 分钟前」更耐看，
+ *  而这一列的信息密度已经够了，不再挂相对时间。 */
+function formatProbeTime(ms: number): string {
+  const date = new Date(ms)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return pad(date.getMonth() + 1) + '-' + pad(date.getDate()) + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes())
+}
+
 /* ─── 限流列 ────────────────────────────────── */
 
 /**

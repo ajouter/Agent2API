@@ -23,5 +23,8 @@
   "跳转到第 1–{pageCount} 页": "Ir para a página 1–{pageCount}",
   "这一列已隐藏": "Esta coluna está oculta",
   "这一列正在显示": "Esta coluna está visível",
-  "页": "pág."
+  "页": "pág.",
+  "舒适": "Confortável",
+  "紧凑": "Compacto",
+  "表格行距：点击在紧凑与舒适之间切换（所有表格一起生效）": "Espaçamento das linhas: clique para alternar entre compacto e confortável (vale para todas as tabelas)"
 }

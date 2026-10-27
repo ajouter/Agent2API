@@ -107,7 +107,7 @@
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  font-size: 13px;
+  font-size: var(--text-base);
   font-weight: 600;
 }
 
@@ -126,7 +126,7 @@
 /* 运行状态一行（上次 / 下次执行）：等宽数字，扫一眼就能对齐比较 */
 .task-state {
   color: var(--text-3);
-  font-size: 11.5px;
+  font-size: var(--text-xs);
   line-height: 1.5;
   font-variant-numeric: tabular-nums;
 }
@@ -145,7 +145,7 @@
   align-items: center;
   gap: 6px;
   color: var(--text-3);
-  font-size: 12px;
+  font-size: var(--text-sm);
   white-space: nowrap;
 }
 

@@ -109,7 +109,7 @@
   display: grid;
   place-items: center;
   border-radius: 12px;
-  font-size: 16px;
+  font-size: var(--text-lg);
   font-weight: 700;
   color: #fff;
   background: linear-gradient(150deg, var(--primary), color-mix(in srgb, var(--primary) 62%, #0b1020));
@@ -136,7 +136,7 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 13.5px;
+  font-size: var(--text-base);
   font-weight: 600;
   line-height: 1.4;
 }
@@ -144,24 +144,24 @@
    BETA_PROVIDERS）。只把字号压一档、颜色退到三级 —— 它是一句注脚，
    不该跟名字争注意力；`.add-provider-name` 的 gap 负责与名字的间距 */
 .add-provider-beta {
-  font-size: 11px;
+  font-size: var(--text-xs);
   font-weight: 600;
   color: var(--text-3);
 }
 .add-provider-meta {
-  font-size: 12px;
+  font-size: var(--text-sm);
   line-height: 1.45;
   color: var(--text-3);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.add-provider-go { flex: 0 0 auto; color: var(--text-3); font-size: 17px; }
+.add-provider-go { flex: 0 0 auto; color: var(--text-3); font-size: var(--text-xl); }
 .add-provider-empty {
   grid-column: 1 / -1;
   padding: 22px;
   text-align: center;
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--text-3);
 }
 
@@ -170,7 +170,7 @@
    锁定后它内部滚动，总高不随条目数变。 */
 #add-import-panel { display: flex; flex-direction: column; gap: 8px; }
 #add-import-panel[hidden] { display: none; }
-#add-import-status { font-size: 12px; color: var(--text-2); }
+#add-import-status { font-size: var(--text-sm); color: var(--text-2); }
 #add-import-status .add-import-head {
   display: flex;
   align-items: center;
@@ -180,7 +180,7 @@
 #add-import-status .linkish {
   height: 24px;
   padding: 0 8px;
-  font-size: 11.5px;
+  font-size: var(--text-xs);
   border-color: transparent;
   background: transparent;
   color: var(--text-3);
@@ -221,7 +221,7 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -229,7 +229,7 @@
 }
 .add-import-badge {
   flex: 0 0 auto;
-  font-size: 10px;
+  font-size: var(--text-2xs);
   font-weight: 600;
   padding: 0 5px;
   border-radius: var(--r-xs);
@@ -237,14 +237,14 @@
   color: var(--text-3);
 }
 .add-import-meta {
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-3);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.add-foot-hint { flex: 1 1 auto; min-width: 0; font-size: 11.5px; color: var(--text-3); }
+.add-foot-hint { flex: 1 1 auto; min-width: 0; font-size: var(--text-xs); color: var(--text-3); }
 .add-foot-hint.err { color: var(--danger); }
 .add-foot-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; }
 .add-foot-actions > button[hidden] { display: none; }
@@ -271,7 +271,7 @@
   gap: 3px;
   height: 30px;
   color: var(--text-2);
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   white-space: nowrap;
 }
 /* 必填只标一枚星号，不把「（必填）」塞进标签：后者让四行标签的字重与长度都不齐 */
@@ -288,13 +288,13 @@
 /* 区块头：一行区块名 + 一行用途说明。区块名取「上游信息」这类**部位名**，
    不再复述弹窗标题 —— 原来卡内 h3、弹窗标题、下面段落三层说同一句话。 */
 .add-panel-head { display: flex; flex-direction: column; gap: 4px; }
-.add-panel-head > span { font-size: 11.5px; line-height: 1.5; color: var(--text-3); }
+.add-panel-head > span { font-size: var(--text-xs); line-height: 1.5; color: var(--text-3); }
 .add-panel-head b { color: var(--text); font-weight: 620; }
 /* 纵向表单行（token / refreshToken）：标签在上、输入框占满整宽 ——
    这些值很长，横排会把输入框压成一条缝 */
 .field-row.stack { flex-direction: column; align-items: stretch; gap: 6px; }
-.field-row.stack > label { color: var(--text-2); font-size: 12.5px; }
-.field-row.stack textarea { width: 100%; min-height: 0; font-family: var(--font-mono); font-size: 11.5px; }
+.field-row.stack > label { color: var(--text-2); font-size: var(--text-sm); }
+.field-row.stack textarea { width: 100%; min-height: 0; font-family: var(--font-mono); font-size: var(--text-xs); }
 
 /* ─── 添加账号弹窗：手机验证码登录（Loomy / AutoClaw 国内版）───
    三行收完：手机号 + 内嵌发码按钮 / 验证码 + 备注名 / 提交 + 提示。
@@ -319,7 +319,7 @@
   justify-content: flex-end;
   gap: 3px;
   color: var(--text-2);
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   white-space: nowrap;
 }
 /* 必填只标一枚星号：两个字段的标签字数不同，再带「（必填）」会右对齐不齐 */
@@ -334,7 +334,7 @@
   align-items: center;
   gap: 3px;
   color: var(--text-2);
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   white-space: nowrap;
 }
 /* 子选择器不是为了好看：components.css 的 `input[type="text"] { flex: 1 1 auto }`

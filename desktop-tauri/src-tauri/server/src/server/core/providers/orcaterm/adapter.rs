@@ -7,11 +7,14 @@
 //! 给的散装入参（原始 body、账号 id、出站代理、流式标志、记账槽）转调
 //! `run_chat`。装配以外的逻辑一行都不在这里。
 //!
-//! ── 与 KukuAI 同属「有状态」但会话是**请求内**的 ──────────────
+//! ── 有状态路径：上游会话**粘住客户端会话**（2026-10-24 起）────────
 //! `is_stateful()` 返回 true：上游一次对话 = 建会话 → SSE 两步，塞不进单请求
 //! 契约（`build_chat_request` 返回 503 防御，理由与 CatPaw / KukuAI 相同）。
-//! 但会话**不跨请求**（每个请求新建、用毕即弃），因此没有会话注册表 /
-//! 轮次状态机 —— `chat::run_chat` 单函数完成全部时序。
+//! 与 KukuAI 的「请求内会话」不同，本家的会话**跨请求粘住**客户端会话
+//! （`session.rs` 注册表）：同一会话的确认 / 结果续写同一个上游
+//! conversationId —— 上游 agent 的「已批准」状态存在服务端会话里，没有
+//! 粘性它跨轮不存活，agent 客户端每确认一次都会被重新问一遍。会话键解析、
+//! 增量输入与失效自愈见 `session.rs` 与 `chat.rs`。
 //!
 //! ── 凭证：OAuth JWT，**有真续期接口**（与 KukuAI / CatPaw 的关键差别）──
 //! `supports_refresh = true`：临期主动刷（`credentials_expiring`，窗口 10 分钟）
@@ -208,7 +211,7 @@ impl ProviderAdapter for OrcatermAdapter {
         store: &'a AccountStore,
         account_id: &'a str,
         body: &'a Value,
-        _client_headers: &'a HeaderMap,
+        client_headers: &'a HeaderMap,
         proxy: Option<ResolvedProxy>,
         stream: bool,
         telemetry: &'a Arc<RequestTelemetry>,
@@ -218,7 +221,7 @@ impl ProviderAdapter for OrcatermAdapter {
         >,
     > {
         Box::pin(async move {
-            chat::run_chat(store, account_id, body, proxy, stream, telemetry).await
+            chat::run_chat(store, account_id, body, client_headers, proxy, stream, telemetry).await
         })
     }
 }

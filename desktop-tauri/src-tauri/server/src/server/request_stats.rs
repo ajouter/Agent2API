@@ -95,7 +95,12 @@ use record::DailyEntry;
 // 拆到子模块的三样，这里引回：record / usage_summary 的折算入口、
 // remap 的库操作体、报表装配（均为 `pub(super)`，见 aggregate.rs 的模块头）
 use aggregate::{fold_into_daily, remap_model_days, summarize};
-use report::{entry_json, provider_label, CACHE_WINDOWS};
+use report::{
+    entry_json, normalize_range, p95_of, provider_label, range_bounds, RangeUsage, CACHE_WINDOWS,
+};
+
+// BTreeMap 在 usage_summary 的按天折算里用
+use std::collections::BTreeMap;
 
 // 均在此 re-export：本模块内部要用（raw_body 的截断判定），api::pipeline
 // 的采集侧也要用（同一份上限常量，见 record::MAX_RAW_BODY_BYTES 的说明）。
@@ -647,11 +652,53 @@ impl RequestStats {
                 // 报表侧排除模型测试（见 `select_summary_rows` 的说明）：
                 // 趋势图与排行回答的是「真实流量长什么样」
                 let entries = sql::select_summary_rows(conn, now - SUMMARY_WINDOW_MS, now)?;
-                Ok((daily, cache_totals, entries))
+                // 概览的输入 / 输出拆分与 P95：明细窄查询按**本区间**取
+                //（区间边界由同一份 range_bounds 现算，与 summarize 的口径一致）
+                let normalized = normalize_range(range);
+                let (start_date, end_date) = range_bounds(normalized, &daily, clock::today(), custom);
+                let usage = match (
+                    chrono::NaiveDate::parse_from_str(&start_date, "%Y-%m-%d").ok(),
+                    chrono::NaiveDate::parse_from_str(&end_date, "%Y-%m-%d").ok(),
+                ) {
+                    (Some(start), Some(end)) => {
+                        let start_ts = clock::local_midnight_ms(start);
+                        // 闭区间上界：次日零点前 1 毫秒（与 rebuild_day 的取法一致）
+                        let end_ts = clock::local_midnight_ms(end + ChronoDuration::days(1))
+                            .saturating_sub(1);
+                        let rows = sql::select_range_usage(conn, start_ts, end_ts)?;
+                        let mut prompt_tokens = 0i64;
+                        let mut completion_tokens = 0i64;
+                        let mut per_day: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+                        let mut durations: Vec<i64> = Vec::new();
+                        for (ts, prompt, completion, duration) in rows {
+                            prompt_tokens += prompt;
+                            completion_tokens += completion;
+                            let key = clock::date_key(clock::day_of(ts));
+                            let entry = per_day.entry(key).or_insert((0, 0));
+                            entry.0 += prompt;
+                            entry.1 += completion;
+                            durations.push(duration);
+                        }
+                        RangeUsage {
+                            prompt_tokens,
+                            completion_tokens,
+                            per_day,
+                            p95_ms: p95_of(&durations),
+                        }
+                    }
+                    // 区间解析不出来（理论上不可达）：按空用量算，概览拆分给 0
+                    _ => RangeUsage {
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        per_day: BTreeMap::new(),
+                        p95_ms: None,
+                    },
+                };
+                Ok((daily, cache_totals, entries, usage))
             })
         };
-        let (daily, cache_totals, entries) = loaded.unwrap_or_default();
-        summarize(&daily, &cache_totals, &entries, range, now, custom)
+        let (daily, cache_totals, entries, usage) = loaded.unwrap_or_default();
+        summarize(&daily, &cache_totals, &entries, &usage, range, now, custom)
     }
 
     /// 明细查询：倒序（新在前）分页。

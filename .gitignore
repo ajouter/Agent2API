@@ -33,3 +33,12 @@ dist/
 # Docker 部署：密钥与运行数据不入库
 .env
 data/
+
+# Windows GNU 工具链的本地链接库（从 rustup sysroot 拷贝，仅本机编译用）
+.rust-link-libs/
+
+# 本地运行数据目录（含 account.key 等密钥，绝不能入库）
+.agent2api/
+
+# 临时启动脚本（本机调试用）
+_start_server.cmd

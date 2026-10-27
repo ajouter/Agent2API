@@ -226,5 +226,8 @@
   "（不会影响客户端登录态）": " (não afeta a sessão de login do cliente)",
   "（仅显示前 20 条，共 {n} 条）": "(mostrando apenas os primeiros 20 de {n})",
   "（未指定）": "(não especificado)",
-  "（默认问候）": "(saudação padrão)"
+  "（默认问候）": "(saudação padrão)",
+  "搜索页面…": "Pesquisar páginas…",
+  "搜索页面": "Pesquisar páginas",
+  "没有匹配的页面": "Nenhuma página correspondente"
 }

@@ -144,11 +144,59 @@ pub(super) fn range_bounds(
     (date_key(start), date_key(end))
 }
 
+/// 等长前期区间（「较上周期」对比的口径）：把当前区间整体往前平移一个
+/// 区间长度。`RANGE_ALL` 恒 None —— 「全部数据」之前没有可对比的完整周期，
+/// 硬算只会得到「较上周期 +∞」的误导。
+///
+/// 返回值与 [`range_bounds`] 同形（本地自然日闭区间的日期键），前端拿到
+/// `previous: null` 就不渲染对比角标。
+pub(super) fn previous_bounds(start_date: &str, end_date: &str, range: &str) -> Option<(String, String)> {
+    if range == RANGE_ALL {
+        return None;
+    }
+    let (Some(start), Some(end)) = (parse_key(start_date), parse_key(end_date)) else {
+        return None;
+    };
+    let length = (end - start).num_days() + 1;
+    let prev_end = start - ChronoDuration::days(1);
+    let prev_start = prev_end - ChronoDuration::days(length - 1);
+    Some((date_key(prev_start), date_key(prev_end)))
+}
+
+/// 一组耗时的 P95（毫秒）。空表 → None（区间内没有终态请求）。
+///
+/// 就近取上分位（`ceil(0.95n) - 1`）：样本少时比线性插值更稳 —— 3 个样本
+/// 的 P95 是最大值而不是平均值附近的数，与「95% 的请求都不慢于它」的语义一致。
+pub(super) fn p95_of(durations: &[i64]) -> Option<i64> {
+    if durations.is_empty() {
+        return None;
+    }
+    let mut sorted = durations.to_vec();
+    sorted.sort_unstable();
+    let index = ((sorted.len() as f64) * 0.95).ceil() as usize - 1;
+    sorted.get(index.min(sorted.len() - 1)).copied()
+}
+
+/// 区间明细用量（概览「输入 / 输出 Token」拆分与 P95 的原料），来自
+/// `sql::select_range_usage` 的窄查询，按 `clock::day_of` 折进本地自然日。
+#[derive(Default)]
+pub(super) struct RangeUsage {
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    /// 本地日期键 → (prompt, completion)：dailyTrend 的逐日拆分
+    pub per_day: BTreeMap<String, (i64, i64)>,
+    pub p95_ms: Option<i64>,
+}
+
 /// 区间内的总量与按模型 / 按 provider / 按账号累计（overview 的原料）
 pub(super) struct RangeTotals {
     pub requests: i64,
     pub successful: i64,
     pub tokens: i64,
+    /// 命中缓存的输入 token 合计（概览「缓存 Token」卡的值）
+    pub cache_hit_tokens: i64,
+    /// 计入缓存口径的输入 token 合计（缓存命中率的分母）
+    pub cache_input_tokens: i64,
     pub active_days: i64,
     pub model_totals: Vec<ModelAccum>,
     pub provider_totals: Vec<ProviderAccum>,
@@ -166,6 +214,8 @@ pub(super) fn range_totals(
         requests: 0,
         successful: 0,
         tokens: 0,
+        cache_hit_tokens: 0,
+        cache_input_tokens: 0,
         active_days: 0,
         model_totals: Vec::new(),
         provider_totals: Vec::new(),
@@ -178,6 +228,8 @@ pub(super) fn range_totals(
         totals.requests += day.requests;
         totals.successful += day.successful;
         totals.tokens += day.tokens;
+        totals.cache_hit_tokens += day.cache_hit_tokens;
+        totals.cache_input_tokens += day.cache_input_tokens;
         // activeDays 只数**区间内**有请求的天数（补零的日子不算「活跃」）
         if day.requests > 0 {
             totals.active_days += 1;
@@ -649,7 +701,12 @@ pub(super) fn build_top_model(totals: &[ModelAccum], range_tokens: i64) -> Value
 /// 柱状图的悬停读数要给出「这一天总用量是多少、分别花在哪些模型上」，
 /// 而按模型的分解只存在于聚合行（`model_tokens` 列）—— 明细只在报表读明细的
 /// 24 小时窗口里才被读，这里拿不到也不会回算（见 [`model_breakdown_json`]）。
-pub(super) fn daily_trend(daily: &BTreeMap<String, DailyEntry>, start: &str, end: &str) -> Vec<Value> {
+pub(super) fn daily_trend(
+    daily: &BTreeMap<String, DailyEntry>,
+    start: &str,
+    end: &str,
+    usage_per_day: &BTreeMap<String, (i64, i64)>,
+) -> Vec<Value> {
     let (Some(start_date), Some(end_date)) = (parse_key(start), parse_key(end)) else {
         return Vec::new();
     };
@@ -660,11 +717,24 @@ pub(super) fn daily_trend(daily: &BTreeMap<String, DailyEntry>, start: &str, end
         let key = date_key(cursor);
         let day = daily.get(&key);
         let (tokens, requests) = day.map(|item| (item.tokens, item.requests)).unwrap_or((0, 0));
+        // successful 与缓存命中列都是聚合行自带字段（DEFAULT 0），缺省 0 与
+        // 「这一天没有请求」同义，前端按 0 画线即可
+        let (successful, cache_tokens) = day
+            .map(|item| (item.successful, item.cache_hit_tokens))
+            .unwrap_or((0, 0));
+        // 输入 / 输出拆分只在明细里（聚合行没有这两列），缺省 0：
+        // 明细被保留容量闸裁掉的老日期是 0，前端画线时如实画 0
+        let (prompt_tokens, completion_tokens) =
+            usage_per_day.get(&key).copied().unwrap_or((0, 0));
         let models = day.map(|item| model_breakdown_json(&item.model_tokens)).unwrap_or_default();
         out.push(json!({
             "date": key,
             "tokens": tokens,
             "requests": requests,
+            "successful": successful,
+            "promptTokens": prompt_tokens,
+            "completionTokens": completion_tokens,
+            "cacheTokens": cache_tokens,
             "models": models,
         }));
         cursor += ChronoDuration::days(1);

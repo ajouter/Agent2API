@@ -80,7 +80,7 @@ import {
 } from './accounts-data'
 import {
   AccountCell, ActionsCell, ConnectionsCell, ExpiryCell, GroupBandRow, LimitsCell, OrderCell,
-  PanelsRow, ProxyCell, StatusCell, TableHead, UsageCell,
+  PanelsRow, ProbeCell, ProxyCell, StatusCell, TableHead, UsageCell,
 } from './accounts-panels'
 import { bindQueueDrag, type QueueDrop } from './accounts-queue-drag'
 import { AccountsDialogs } from './accounts-dialogs'
@@ -230,6 +230,25 @@ function AccountsPage() {
   })
   // 登记重试的驱动：定时器到点改一次这个计数，让上面的布局 effect 再跑一遍
   const [, setRetryTick] = React.useState(0)
+  // 凭证探针（B 方案）：跑的时候禁用按钮并换文案 —— 后端串行执行，账号多时这条
+  // 会明显慢（每账号一个往返），不给反馈用户会以为按钮没生效
+  const [probing, setProbing] = React.useState(false)
+  /** 逐个检测全部账号的凭证有效性。跑完重拉一次列表，让 probeStatus 落到界面上。 */
+  const runProbe = async () => {
+    if (probing) return
+    setProbing(true)
+    try {
+      await fetch('/api/accounts/probe', { method: 'POST', credentials: 'same-origin' })
+      // 探针结论已落后端缓存，重拉列表把它带回来。
+      // window.wbApp.refresh 是 app.js 的全局加载器（会重拉 /api/accounts 并重建 store）
+      const app = (window as unknown as { wbApp?: { refresh?: () => Promise<void> } }).wbApp
+      await app?.refresh?.()
+    } catch {
+      // 网络失败静默：按钮恢复可点，用户可以再点一次
+    } finally {
+      setProbing(false)
+    }
+  }
   React.useEffect(() => () => window.clearTimeout(colSettingsRetry), [])
 
   // 列宽拖拽（pointerdown 开拖 / dblclick 还原）委托在滚动容器上一次即可：
@@ -351,6 +370,8 @@ function AccountsPage() {
         return <ConnectionsCell account={account} />
       case 'status':
         return <StatusCell account={account} />
+      case 'probe':
+        return <ProbeCell account={account} />
       case 'limits':
         return <LimitsCell account={account} open={ctx.limitsOpen} />
       case 'expiry':
@@ -490,6 +511,14 @@ function AccountsPage() {
             </span>
           ) : null}
           <div className='batch-actions'>
+            {/* 凭证探针（B 方案）：逐个真打一次上游只读接口，把「有效 / 失效」变成
+                看得见的事实。串行执行（后端避免并发触发风控），账号多时会慢，
+                所以按钮在跑的时候禁用并换文案。 */}
+            <Button id='btn-probe-all' variant='outline' disabled={probing}
+              title={t('逐个检查每个账号的凭证此刻是否真的可用（会真打一次上游只读接口，不消耗额度）')}
+              onClick={() => void runProbe()}>
+              {probing ? t('检测中…') : t('全部检测')}
+            </Button>
             {/* 「列设置」按钮由 wbColSettings.register 插进这个容器的最前面（命令式，
                 插入位置由那边决定，本岛只留容器） */}
             <Button id='btn-batch-open' variant='outline' disabled={!active}

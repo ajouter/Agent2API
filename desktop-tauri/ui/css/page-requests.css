@@ -58,7 +58,7 @@
   border-bottom: 1px solid var(--border);
   background: var(--table-head-bg);
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--text-xs);
   font-weight: 600;
   letter-spacing: .02em;
 }
@@ -196,7 +196,7 @@
   max-width: 100%;
   color: var(--text-3);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -257,7 +257,7 @@
   flex-direction: column;
   color: var(--text-3);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
@@ -287,8 +287,8 @@
   white-space: nowrap;
 }
 
-.req-row .req-provider { color: var(--text-2); font-size: 12px; }
-.req-row .req-acct { color: var(--text-3); font-size: 11.5px; }
+.req-row .req-provider { color: var(--text-2); font-size: var(--text-sm); }
+.req-row .req-acct { color: var(--text-3); font-size: var(--text-xs); }
 
 /* 无提供商 / 无账号（旧数据或请求在任何账号接手前就失败）：给破折号 */
 .req-provider.is-empty,
@@ -300,7 +300,7 @@
   overflow: hidden;
   color: var(--text);
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--text-sm);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -311,7 +311,7 @@
   min-width: 0;
   overflow: hidden;
   color: var(--text-2);
-  font-size: 12px;
+  font-size: var(--text-sm);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -336,7 +336,7 @@
 
 .req-row .req-model-line.sub {
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--text-xs);
 }
 
 /* 用时：等宽 + 右对齐，相邻行的数字能直接竖着比大小。
@@ -350,7 +350,7 @@
   gap: 2px;
   color: var(--text);
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
   text-align: right;
   white-space: nowrap;
@@ -365,7 +365,7 @@
 /* 首响是次读数：淡一档、小半号，不抢总用时 */
 .req-row .req-dur-line.sub {
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--text-xs);
 }
 
 /* 用量两行：in / out / all 与 缓存读取 / 命中率（生成速度 tok/s 跟在命中率后，同一行）。
@@ -386,7 +386,7 @@
   max-width: 100%;
   color: var(--text-2);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -474,7 +474,7 @@
 /* 详情按钮：小号、无边框感（一列里最轻的控件，不与状态徽章抢注意力） */
 .req-detail-btn {
   padding: 2px 8px;
-  font-size: 11.5px;
+  font-size: var(--text-xs);
 }
 
 /* 「终止请求」按钮与详情网格的样式已随迁移移除（见上）。
@@ -494,7 +494,7 @@
   background: var(--surface-2, var(--surface));
   color: var(--text-2);
   font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
-  font-size: 11.5px;
+  font-size: var(--text-xs);
   line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
@@ -579,7 +579,7 @@
 .rh-title {
   margin-bottom: 4px;
   color: var(--text-3);
-  font-size: 11.5px;
+  font-size: var(--text-xs);
   font-weight: 600;
   letter-spacing: .02em;
 }
@@ -635,7 +635,7 @@
 
 .rh-retry-head {
   color: var(--warn);
-  font-size: 11.5px;
+  font-size: var(--text-xs);
   font-weight: 600;
 }
 
@@ -706,7 +706,7 @@
   max-width: 75%;
   padding: 8px 12px;
   border-radius: 10px;
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   line-height: 1.65;
   overflow-wrap: break-word;
 }
@@ -724,7 +724,7 @@
   max-width: 90%;
   background: var(--surface-inset);
   color: var(--text-2);
-  font-size: 12px;
+  font-size: var(--text-sm);
   border-radius: 8px;
 }
 
@@ -752,11 +752,11 @@
 .cv-details > summary {
   cursor: pointer;
   color: var(--text-3);
-  font-size: 11.5px;
+  font-size: var(--text-xs);
   user-select: none;
 }
 .cv-details[open] > summary { margin-bottom: 4px; }
-.cv-reasoning { color: var(--text-2); font-size: 12px; }
+.cv-reasoning { color: var(--text-2); font-size: var(--text-sm); }
 
 /* 工具结果：全宽虚线框，与对话气泡在视觉上区分开 */
 details.cv-tool {
@@ -766,15 +766,15 @@ details.cv-tool {
   border-radius: 10px;
   background: var(--surface-2);
   color: var(--text-2);
-  font-size: 12px;
+  font-size: var(--text-sm);
 }
 
 details.cv-tool > summary { cursor: pointer; color: var(--text-3); }
 
 /* 工具调用块（助手气泡内）：标题 + 参数原文 */
 .cv-toolcall { margin-top: 8px; }
-.cv-toolcall-name { margin-bottom: 3px; color: var(--text-3); font-size: 11.5px; }
-.cv-pre { max-height: 220px; font-size: 11px; }
+.cv-toolcall-name { margin-bottom: 3px; color: var(--text-3); font-size: var(--text-xs); }
+.cv-pre { max-height: 220px; font-size: var(--text-xs); }
 
 /* 解析失败的说明行（原文折叠跟在它后面）/ 读取侧的截断提示 */
-.cv-parse-empty { color: var(--text-3); font-size: 12px; }
+.cv-parse-empty { color: var(--text-3); font-size: var(--text-sm); }

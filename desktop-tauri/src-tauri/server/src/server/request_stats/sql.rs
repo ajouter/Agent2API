@@ -505,6 +505,36 @@ pub(super) fn select_summary_rows(
     Ok(out)
 }
 
+/// 区间用量窄行（`ts, prompt_tokens, completion_tokens, duration_ms`）：
+/// 概览的「输入 / 输出 Token 拆分」与「P95 延迟」的原料。
+///
+/// ── 为什么不走 `request_daily` 聚合表 ────────────────────────
+/// 聚合行只有 token 总量（`tokens`）与缓存两列，没有输入 / 输出拆分——
+/// 拆分目前在明细里。而明细有 `ts` 索引 + 固定的保留容量闸，一次按区间
+/// 索引扫描只读这 4 列，代价与 `select_summary_rows` 同一量级；为两个
+/// 概览数拆新聚合列（schema 迁移 + 三条累加路径同改）不值当。缓存命中
+/// 两列聚合表里就有（`range_totals` 直接加总），不在这条查询里。
+///
+/// 口径与 [`select_summary_rows`] 一致：`is_test = 0` 排除测试流量；
+/// `status != 0` 排除进行中行（它们没有 token 也没有耗时，与日报的
+/// 「只折终态」同一口径，P95 的分母也因此与失败数口径对齐）。
+pub(super) fn select_range_usage(
+    conn: &Connection,
+    from_ms: i64,
+    to_ms: i64,
+) -> rusqlite::Result<Vec<(i64, i64, i64, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT ts, prompt_tokens, completion_tokens, duration_ms FROM requests \
+         WHERE ts >= ?1 AND ts <= ?2 AND status != 0 AND is_test = 0",
+    )?;
+    let mut rows = stmt.query(params![from_ms, to_ms])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?));
+    }
+    Ok(out)
+}
+
 /// 各命中率窗口的 `(hitTokens, inputTokens)` 合计，**一次索引扫描算完**。
 ///
 /// ── 为什么下推给 SQL ────────────────────────────────────────

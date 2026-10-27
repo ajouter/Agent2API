@@ -226,5 +226,8 @@
   "（不会影响客户端登录态）": "(does not affect the client's sign-in state)",
   "（仅显示前 20 条，共 {n} 条）": "(showing the first 20 of {n})",
   "（未指定）": "(not specified)",
-  "（默认问候）": "(default greeting)"
+  "（默认问候）": "(default greeting)",
+  "搜索页面…": "Search pages…",
+  "搜索页面": "Search pages",
+  "没有匹配的页面": "No matching pages"
 }

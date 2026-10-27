@@ -96,6 +96,17 @@ pub fn normalize_token(raw: &str) -> String {
     if let Some(rest) = token.strip_prefix("Bearer ").or_else(|| token.strip_prefix("bearer ")) {
         token = rest.trim().to_string();
     }
+    // Cookie 面板整行复制的形态（2026-10-26 用户实测踩坑）：令牌后面粘着
+    // 「; SameSite=Lax; Secure; …」一串属性，或串里还混着别的 cookie。
+    // JWT 本体不含分号，按分号截断不会伤到令牌：
+    //   · 「foo=1; ot_session=JWT; 属性…」→ 定位 ot_session= 再取到分号
+    //   · 「JWT; 属性…」/「ot_session=JWT; 属性…」→ 取分号前段
+    if let Some(pos) = token.find("ot_session=") {
+        let rest = &token[pos + "ot_session=".len()..];
+        token = rest[..rest.find(';').unwrap_or(rest.len())].trim().to_string();
+    } else if let Some(pos) = token.find(';') {
+        token = token[..pos].trim().to_string();
+    }
     token
 }
 
@@ -234,24 +245,51 @@ pub fn desktop_summary() -> Result<Value, String> {
 
 /// CGI 网关的请求头（`Authorization: Bearer`；`uin` 在 query 上，不在头里）。
 pub fn cgi_headers(credentials: &OrcatermCredentials) -> Vec<(String, String)> {
+    let mut cookie = format!(
+        "ot_session={}; userAccountLoginMethod=oauth; userAccountType=wechat",
+        credentials.access_token
+    );
+    if !credentials.user_id.trim().is_empty() {
+        cookie.push_str(&format!("; userId={}", credentials.user_id.trim()));
+    }
     vec![
         ("Authorization".to_string(), format!("Bearer {}", credentials.access_token)),
         ("Content-Type".to_string(), "application/json".to_string()),
         ("User-Agent".to_string(), USER_AGENT.to_string()),
         ("Origin".to_string(), "https://orcaterm.cloud.tencent.com".to_string()),
         ("Referer".to_string(), "https://orcaterm.cloud.tencent.com/".to_string()),
+        ("Cookie".to_string(), cookie),
     ]
 }
 
-/// assistant 网关的请求头（`X-Product: orcaterm` 是本家的产品标识）。
+/// assistant 网关的请求头 —— **桌面客户端同款指纹**（2026-10-26 实测修正）。
+///
+/// 上游收紧了鉴权：光有 `Authorization: Bearer` 已不认（`NEED_UIN_AND_SKEY` /
+/// `Invalid or expired AccessToken`），必须带桌面客户端同款的 **Cookie 指纹**
+/// （`ot_session` + `userAccountLoginMethod=oauth` + `userAccountType=wechat`
+/// + `userId`——上游按这组 cookie 识别凭证形态）与三个客户端头
+/// （`X-Seq-Id` / `X-Csrfcode` / `X-Referer`；旧实现发的 `x-seqid` 名字就是错的）。
+/// 指纹取自参考项目 orcaterm2api 的 setHeaders（桌面态），实测建会话 code=0。
 pub fn lightai_headers(credentials: &OrcatermCredentials, seq_id: &str) -> Vec<(String, String)> {
+    let mut cookie = format!(
+        "ot_session={}; userAccountLoginMethod=oauth; userAccountType=wechat",
+        credentials.access_token
+    );
+    if !credentials.user_id.trim().is_empty() {
+        cookie.push_str(&format!("; userId={}", credentials.user_id.trim()));
+    }
     vec![
-        ("Authorization".to_string(), format!("Bearer {}", credentials.access_token)),
+        ("Content-Type".to_string(), "application/json".to_string()),
+        ("Accept".to_string(), "text/event-stream, application/json".to_string()),
         ("X-Product".to_string(), "orcaterm".to_string()),
-        ("x-seqid".to_string(), seq_id.to_string()),
-        ("User-Agent".to_string(), USER_AGENT.to_string()),
+        ("X-Seq-Id".to_string(), seq_id.to_string()),
+        ("X-Csrfcode".to_string(), String::new()),
+        ("X-Referer".to_string(), "https://orcaterm.cloud.tencent.com/".to_string()),
         ("Origin".to_string(), "https://orcaterm.cloud.tencent.com".to_string()),
         ("Referer".to_string(), "https://orcaterm.cloud.tencent.com/".to_string()),
+        ("User-Agent".to_string(), USER_AGENT.to_string()),
+        ("Authorization".to_string(), format!("Bearer {}", credentials.access_token)),
+        ("Cookie".to_string(), cookie),
     ]
 }
 
@@ -437,4 +475,22 @@ pub fn snapshot_for(
             .unwrap_or(jwt_user_id),
         nickname: record.get("loginName").and_then(Value::as_str).unwrap_or("").to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_strips_cookie_attributes() {
+        // DevTools Cookie 面板整行复制：值后面粘着一串属性（2026-10-26 踩坑形态）
+        let raw = "ot_session=eyJabc.def.ghi; SameSite=Lax; Secure; Path=/; Expires=Sat, 31 Oct 2026 16:45:44 GMT";
+        assert_eq!(normalize_token(raw), "eyJabc.def.ghi");
+        // 混串：ot_session 不在行首（前面还有别的 cookie）
+        assert_eq!(normalize_token("foo=1; ot_session=eyJabc.def.ghi; X=y"), "eyJabc.def.ghi");
+        // 既有形态不受影响
+        assert_eq!(normalize_token("eyJabc.def.ghi"), "eyJabc.def.ghi");
+        assert_eq!(normalize_token("Bearer eyJabc.def.ghi"), "eyJabc.def.ghi");
+        assert_eq!(normalize_token("Bearer eyJabc.def.ghi"), "eyJabc.def.ghi");
+    }
 }

@@ -83,7 +83,7 @@
   border-bottom: 1px solid var(--hairline);
   background: var(--surface);
   color: var(--text-2);
-  font-size: 11.5px;
+  font-size: var(--text-xs);
 }
 
 .batch-bar.active { background: var(--primary-soft); border-bottom-color: var(--primary-bd); }
@@ -95,11 +95,11 @@
 .batch-count { color: var(--text-3); white-space: nowrap; }
 .batch-count b { color: var(--text); font-variant-numeric: tabular-nums; }
 
-.batch-hidden { color: var(--warn); font-size: 11px; }
+.batch-hidden { color: var(--warn); font-size: var(--text-xs); }
 
 /* 批量栏里的分组摘要（「N 家 · 显示 M 行」）：分组带逐段给了各家的账号数，
    这里只说「当前看到几家几行」，不再重复各家的明细 */
-.batch-summary { color: var(--text-3); font-size: 11.5px; white-space: nowrap; }
+.batch-summary { color: var(--text-3); font-size: var(--text-xs); white-space: nowrap; }
 
 /* 「清除筛选」是一条轻动作（就在批量栏里，与批量操作同一行）：
    它改的是「怎么看」，不该与右侧那两颗操作按钮同权重 */
@@ -111,7 +111,7 @@
   background: transparent;
   box-shadow: none;
   color: var(--text-2);
-  font-size: 11px;
+  font-size: var(--text-xs);
 }
 
 .batch-bar .link-btn:hover { background: var(--nav-hover); color: var(--text); }
@@ -140,7 +140,7 @@
   height: 25px;
   padding: 0 9px;
   border-radius: var(--r-sm);
-  font-size: 11.5px;
+  font-size: var(--text-xs);
 }
 
 /* ─── 页脚 ───
@@ -180,7 +180,7 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -188,7 +188,7 @@
 }
 
 .limiter-rule-ops { display: flex; flex: none; }
-.limiter-rule-ops button { height: 25px; padding: 0 8px; font-size: 11.5px; }
+.limiter-rule-ops button { height: 25px; padding: 0 8px; font-size: var(--text-xs); }
 
 /* 编辑器实况提示（限制器二级弹层里）：与弹层字段的标签列对齐（76px + 间距 10px） */
 .limiter-hint {
@@ -208,8 +208,8 @@
 .acct-dlg-rail { flex: 0 0 148px; min-height: 0; }
 
 .acct-dlg-main { flex: 1; min-width: 0; padding: 14px 20px 16px; }
-.acct-dlg-pane-head h3 { font-size: 13.5px; font-weight: 600; }
-.acct-dlg-pane-head p { font-size: 12px; color: var(--text-3); line-height: 1.7; margin-top: 2px; }
+.acct-dlg-pane-head h3 { font-size: var(--text-base); font-weight: 600; }
+.acct-dlg-pane-head p { font-size: var(--text-sm); color: var(--text-3); line-height: 1.7; margin-top: 2px; }
 /* 内容区字段：标签定宽右对齐（原型网格的落点），跨弹窗分段共用。
    行距在内容区统一给（全局 .field-row 没有 margin —— 旧弹窗的行距是逐行手挂
    mt-2.5 撑出来的，分组结构下再逐行挂迟早漏一行，就长成「没有间距」的样子）。 */
@@ -225,7 +225,7 @@
 .usage-token-sub {
   display: block;
   margin-top: 3px;
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-3);
   font-variant-numeric: tabular-nums;
   overflow: hidden;

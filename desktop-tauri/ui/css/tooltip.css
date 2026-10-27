@@ -17,7 +17,7 @@
   border-radius: var(--r-pill);
   background: transparent;
   color: var(--text-3);
-  font-size: 10.5px;
+  font-size: var(--text-2xs);
   font-weight: 700;
   line-height: 1;
   cursor: help;
@@ -59,7 +59,7 @@
   /* 主色底上的前景：与主按钮（components.css 的 button.primary）同款派生 ——
      直接用 --surface 在深色主题会得到近黑字，这里向白提亮才是可读的近白 */
   color: color-mix(in srgb, var(--surface) 8%, white);
-  font-size: 11.5px;
+  font-size: var(--text-xs);
   line-height: 1.55;
   /* 说明里可能带长 URL / 长单词，按词断行，必要时由 JS 升级为 anywhere */
   overflow-wrap: break-word;

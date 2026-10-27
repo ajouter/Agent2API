@@ -71,6 +71,11 @@ export const ACCOUNT_COLUMNS: AccountColumn[] = [
   },
   { key: 'status', label: t('状态'), align: 'center', legacyAlign: 'left' },
   {
+    key: 'probe', label: t('凭证'),
+    title: t('凭证探针结果：绿 = 上游确认可用，红 = 上游明确拒绝，灰 = 未检测或问不到。点「全部检测」会逐个真打一次上游只读接口'),
+    align: 'center',
+  },
+  {
     key: 'limits', label: t('限流'),
     title: t('该账号当前限流中的模型；点徽章看明细'),
     align: 'center', legacyAlign: 'left',
@@ -108,6 +113,7 @@ const DEFAULTS: Record<string, number> = {
   proxy: 186,
   connections: 56,
   status: 80,
+  probe: 72,
   limits: 148,
   expiry: 80,
   usage: 132,

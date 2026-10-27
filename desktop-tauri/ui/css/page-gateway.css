@@ -29,9 +29,9 @@
 
 .ep-head { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; }
 
-.ep-name { color: var(--text); font-size: 12.5px; font-weight: 600; }
+.ep-name { color: var(--text); font-size: var(--text-sm); font-weight: 600; }
 
-.ep-note { color: var(--text-3); font-size: 11.5px; }
+.ep-note { color: var(--text-3); font-size: var(--text-xs); }
 
 .ep-line { display: flex; align-items: center; gap: 9px; margin-top: 5px; }
 
@@ -39,7 +39,7 @@
   flex: 0 1 auto;
   min-width: 0;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--text-2);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -55,7 +55,7 @@
   border-bottom: 1px solid var(--hairline);
   background: var(--surface-inset);
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--text-xs);
   font-weight: 600;
   letter-spacing: .04em;
 }
@@ -97,9 +97,9 @@
 /* 窄窗口下标题与动作按钮允许各占一行 */
 @media (max-width: 900px) { .mm-titlebar { flex-wrap: wrap; row-gap: 6px; } }
 .mm-title { display: flex; align-items: center; gap: 9px; min-width: 0; }
-.mm-title h2 { margin: 0; font-size: 15px; font-weight: 650; line-height: 1.25; white-space: nowrap; }
+.mm-title h2 { margin: 0; font-size: var(--text-lg); font-weight: 650; line-height: 1.25; white-space: nowrap; }
 /* 统计：三个数加重量、文字用灰档 —— 读的是数字，不是句子 */
-.mm-meta { color: var(--text-3); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mm-meta { color: var(--text-3); font-size: var(--text-sm); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .mm-meta b { font-weight: 600; color: var(--text-2); font-variant-numeric: tabular-nums; }
 
 .mm-filters {
@@ -129,7 +129,7 @@
   border-radius: var(--r-pill);
   background: var(--primary-soft);
   color: var(--primary-fg);
-  font-size: 12px;
+  font-size: var(--text-sm);
   white-space: nowrap;
 }
 .batch-chip b { font-weight: 700; font-variant-numeric: tabular-nums; }
@@ -162,7 +162,7 @@
   width: 100%;
   border-collapse: collapse;
   table-layout: fixed;
-  font-size: 12.5px;
+  font-size: var(--text-sm);
 }
 
 /* 单元格内边距统一 8px（上下左右同值）：列宽本来就紧（七列分 100%），
@@ -177,7 +177,7 @@
   border-bottom: 1px solid var(--border);
   background: var(--table-head-bg);
   color: var(--text-3);
-  font-size: 10.5px;
+  font-size: var(--text-2xs);
   font-weight: 600;
   letter-spacing: .05em;
   text-align: left;
@@ -194,7 +194,7 @@
    行高收紧一档（上下 7px）、左右给到 10px 便于扫读；表头字号提到 11px、
    去掉字距（中文不受益）。只住本页 —— 网关 Key 页共用 .models-table
    骨架与列宽拖动，不跟着这组覆盖走。 */
-.page[data-page="gateway"] .models-table thead th { padding: 8px 10px; font-size: 11px; letter-spacing: 0; }
+.page[data-page="gateway"] .models-table thead th { padding: 8px 10px; font-size: var(--text-xs); letter-spacing: 0; }
 .page[data-page="gateway"] .models-table td { padding: 7px 10px; }
 
 /* 表头的问号提示（完整口径从括号长标题挪进 title，见 models-page）——
@@ -265,7 +265,7 @@
   padding: 5px 8px;
   background: var(--surface-2);
   color: var(--text-2);
-  font-size: 11.5px;
+  font-size: var(--text-xs);
   font-weight: 600;
 }
 .models-table .tr-group td:hover { background: var(--surface-2); }
@@ -286,7 +286,7 @@
    可点样式只给带 data-copy 的名字：`.mid .t` 是模型管理 / 网关 Key 两页
    共用的，Key 页的名字不可复制，别把指针样式串过去。 */
 .mid { display: flex; align-items: center; gap: 6px; min-width: 0; }
-.mid .t { font-family: var(--font-mono); font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mid .t { font-family: var(--font-mono); font-size: var(--text-sm); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .keys-table .mid .t { font-family: var(--font-sans); }
 .models-table .mid .t[data-copy],
 .models-table .alias .t[data-copy] { cursor: pointer; }
@@ -299,8 +299,8 @@
 /* 点击瞬间压淡一下：复制没有可见的落点（toast 之外），这一下是「点到了」的凭据 */
 .models-table .mid .t[data-copy]:active,
 .models-table .alias .t[data-copy]:active { opacity: .55; }
-.mname { color: var(--text-3); font-size: 11.5px; }
-.rate { font-family: var(--font-mono); font-size: 11.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+.mname { color: var(--text-3); font-size: var(--text-xs); }
+.rate { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--text-3); font-variant-numeric: tabular-nums; }
 
 /* ── 能力位两列（「上下文 / 输出」与「能力」）─────────────────────────
    cell 内容是一个按钮：点开「模型能力」弹窗。两列的入口语义相同（能力是一个
@@ -335,7 +335,7 @@
   align-items: center;
   gap: 3px;
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
   color: var(--text-2);
 }
@@ -345,13 +345,13 @@
    数字本身）。与圆点的内侧描边是同一套语义：这一项不是上游说的。
    悬停提示里会写明「其中 最大输出 Token 由 models.dev 补齐」。 */
 .cap-num.filled { text-decoration: underline dotted var(--text-3); text-underline-offset: 3px; }
-.cap-sep { color: var(--text-3); font-size: 11px; }
+.cap-sep { color: var(--text-3); font-size: var(--text-xs); }
 
 /* ── 「来源」列：色点 + 小字（2026-10 重设计）──────────────
    原描边徽标在这一列是满屏的小框框（每行都在重复同一个词），换成色点后
    扫表时只剩「点的颜色」一个信号：远程 = 品牌蓝（正常态）、内置 = 灰
    （还没拉到目录）、手动 = 琥珀（人工登记，可移除）。 */
-.src { display: inline-flex; align-items: center; gap: 5px; color: var(--text-3); font-size: 11.5px; white-space: nowrap; }
+.src { display: inline-flex; align-items: center; gap: 5px; color: var(--text-3); font-size: var(--text-xs); white-space: nowrap; }
 .src i { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--text-3); opacity: .55; }
 .src.remote { color: var(--text-2); }
 .src.remote i { background: var(--primary); opacity: 1; }
@@ -416,7 +416,7 @@
   background: var(--surface-3);
   color: var(--text);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--text-xs);
   font-weight: 600;
 }
 .alias.off { border-color: var(--border); background: var(--surface-inset); color: var(--text-3); text-decoration: line-through; }
@@ -426,7 +426,7 @@
 .alias.map-off { border-style: dashed; background: transparent; color: var(--text-3); }
 .alias.map-off .t { text-decoration: line-through; font-weight: 500; }
 .alias .t { min-width: 0; overflow-wrap: anywhere; }
-.binding-default { flex: 0 0 auto; padding: 0 4px; border: 1px solid var(--border); border-radius: var(--r-xs); background: var(--surface); color: var(--text-3); font-family: var(--font-sans); font-size: 10px; font-weight: 500; }
+.binding-default { flex: 0 0 auto; padding: 0 4px; border: 1px solid var(--border); border-radius: var(--r-xs); background: var(--surface); color: var(--text-3); font-family: var(--font-sans); font-size: var(--text-2xs); font-weight: 500; }
 .alias .switch { flex: 0 0 auto; }
 .alias .alias-level, .alias .x { flex: 0 0 auto; }
 
@@ -446,7 +446,7 @@
   box-shadow: none;
   color: inherit;
   opacity: .6;
-  font-size: 12px;
+  font-size: var(--text-sm);
   line-height: 1;
 }
 .alias .x:hover:not(:disabled) { opacity: 1; background: color-mix(in srgb, var(--text) 10%, transparent); color: inherit; border-color: transparent; }
@@ -457,7 +457,7 @@
 
 /* 网关 Key 页：key 单元格 */
 .keycell { display: flex; align-items: center; gap: 6px; min-width: 0; }
-.keycell .kv { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); font-size: 12px; }
+.keycell .kv { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); font-size: var(--text-sm); }
 
 /* 新建 / 编辑 Key 弹窗里的两个多选（可用提供商 / 可用模型）。
    原生 select 留在壳里当宽高锚，给它一个「够放下两个中文名」的下限、上界收在
@@ -576,14 +576,14 @@
   gap: 8px;
   margin: 10px 4px 5px;
   color: var(--text-3);
-  font-size: 10.5px;
+  font-size: var(--text-2xs);
   font-weight: 700;
   letter-spacing: .08em;
   white-space: nowrap;
 }
 .rail-label:first-child { margin-top: 0; }
 .rail-label::after { content: ""; flex: 1; height: 1px; background: var(--hairline); }
-.rail-empty { padding: 2px 10px 6px; color: var(--sidebar-muted); font-size: 11.5px; }
+.rail-empty { padding: 2px 10px 6px; color: var(--sidebar-muted); font-size: var(--text-xs); }
 
 /* ── 提供商头像（2026-10 重设计）──────────────────────────
    收录过图标的家用**真实图标**（内置家按 id 查 PROVIDER_ICONS，自定义家按名字
@@ -602,7 +602,7 @@
   border-radius: 6px;
   background: oklch(0.68 0.13 var(--av-h, 260) / 18%);
   color: oklch(0.70 0.14 var(--av-h, 260));
-  font-size: 10.5px;
+  font-size: var(--text-2xs);
   font-weight: 700;
   line-height: 1;
   overflow: hidden;
@@ -621,7 +621,7 @@
 :root[data-theme='light'] .pv-ico.img { background: var(--control-bg); color: initial; padding: 2px; }
 .pv-ico.img img { width: 100%; height: 100%; object-fit: contain; display: block; }
 /* 面板头标题上的那枚：大一档（它是这页的「页签」） */
-.mm-title .pv-ico { width: 26px; height: 26px; border-radius: 8px; font-size: 12px; }
+.mm-title .pv-ico { width: 26px; height: 26px; border-radius: 8px; font-size: var(--text-sm); }
 .mm-title .pv-ico svg { width: 14px; height: 14px; }
 
 /* 计数改小药丸（2026-10 重设计）：NavItem 渲染的计数 span 加底色与圆角。
@@ -671,7 +671,7 @@
   background: transparent;
   box-shadow: none;
   color: var(--sidebar-muted);
-  font-size: 15px;
+  font-size: var(--text-lg);
   line-height: 1;
   opacity: 0;
   cursor: pointer;

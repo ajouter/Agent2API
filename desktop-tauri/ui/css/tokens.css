@@ -96,6 +96,23 @@
   --r-lg: var(--radius);
   --r-xl: calc(var(--radius) * 1.4);
   --r-pill: 999px;
+/* 排版阶梯（v2 全站收敛：page-*.css 的 font-size 一律引用，不再写散值） */
+--text-2xs: 10.5px;
+--text-xs: 11.5px;
+--text-sm: 12.5px;
+--text-base: 13.5px;
+--text-lg: 15px;
+--text-xl: 18px;
+--text-2xl: 22px;
+/* 间距阶梯（新样式优先引用；存量页面的单值间距已脚本化收敛） */
+--s-1: 4px;
+--s-2: 6px;
+--s-3: 8px;
+--s-4: 10px;
+--s-5: 12px;
+--s-6: 16px;
+--s-7: 20px;
+--s-8: 24px;
 
   /* 阴影 */
   --shadow-1: 0 1px 2px oklch(0.145 0 0 / 5%);
@@ -122,7 +139,7 @@
      这个变量只描述内容区的限宽，全站所有页面一律用它，不存在按页面的覆盖
      （账号页曾自带一条 max-width: 1400px，已删：它比那张表自身的下限还窄，
      只换来「横滚条常驻 + 比别的页窄一截」，见 page-accounts.css）。 */
-  --content-max: 80vw;
+  --content-max: min(1440px, 92vw);
   --sb-w: 11px;          /* 滚动条宽度：表头对齐要靠它补偿 */
 }
 

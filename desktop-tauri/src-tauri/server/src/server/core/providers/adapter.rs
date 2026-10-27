@@ -362,6 +362,55 @@ pub enum ReasoningPatch {
 /// trait 里不能写 `async fn`（Rust 1.77 的 MSRV 不支持原生 async fn in trait，
 /// 而 `async_trait` crate 会给每个方法加一层 Box 分配）。手写 Box 的代价
 /// 只在这几个签名上，收益是 trait 保持 object-safe 且不引入新依赖。
+/// 一次凭证探针的结果（B 方案：账号列表的有效性状态）。
+///
+/// 三态而不是布尔：`Unknown` 是**必需的第三态** —— 网络超时、代理不通、
+/// 该家没实现探针都归这里。把「问不到」说成「无效」会让人误删好账号，
+/// 说成「有效」又会让坏账号继续留在池子里，两种都是错的。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountProbe {
+    /// 上游确认凭证可用
+    Valid,
+    /// 上游明确拒绝（401/403 / 业务错误码 = 凭证类失败）
+    Invalid { reason: String },
+    /// 问不到（网络错误 / 未实现 / 无法判定）
+    Unknown { reason: String },
+}
+
+impl AccountProbe {
+    pub fn valid() -> Self {
+        Self::Valid
+    }
+
+    pub fn invalid(reason: impl Into<String>) -> Self {
+        Self::Invalid {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn unknown(reason: impl Into<String>) -> Self {
+        Self::Unknown {
+            reason: reason.into(),
+        }
+    }
+
+    /// 落进账号列表的字符串形态（前端按这三个值着色）。
+    pub fn status(&self) -> &'static str {
+        match self {
+            Self::Valid => "valid",
+            Self::Invalid { .. } => "invalid",
+            Self::Unknown { .. } => "unknown",
+        }
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Valid => None,
+            Self::Invalid { reason } | Self::Unknown { reason } => Some(reason),
+        }
+    }
+}
+
 pub trait ProviderAdapter: Send + Sync {
     /// 本适配器对应的 provider
     fn kind(&self) -> ProviderKind;
@@ -779,6 +828,32 @@ pub trait ProviderAdapter: Send + Sync {
     /// 真正的网络动作由 [`Self::refresh_access_token`] 在锁外做。
     fn credentials_expiring(&self, _store: &AccountStore, _account_id: &str) -> bool {
         false
+    }
+
+    /// 探针：验证这个账号的凭证此刻**是否真的可用**（B 方案：账号列表状态）。
+    ///
+    /// ── 与 `credentials_expiring` 的分工 ──────────────────────
+    /// 那个是**本地推断**（看 expiresAt / JWT exp），不碰网络；本方法是**真打一次
+    /// 上游轻量接口**，回答「上游认不认这枚 token」。两者互补：本地推断便宜但会
+    /// 被「服务端侧失效 / 被顶下线 / token 被吊销」骗过去，探针准确但要花一个请求。
+    ///
+    /// ── 为什么必须有它 ────────────────────────────────────────
+    /// 改造前账号是否失效只能等**真实转发失败一次**才知道（401 才触发懒刷新），
+    /// 于是账号池里混着死号、界面完全看不出来、选路时照样轮询到它们。
+    /// 探针让「有效性」变成一个可以主动问的问题。
+    ///
+    /// ── 实现约定 ──────────────────────────────────────────────
+    /// · 只打**只读、轻量、无副作用**的接口（用户信息 / 余额一类），绝不发消息；
+    /// · 判据只看 HTTP 状态与业务错误码，不看具体响应体内容；
+    /// · 网络错误（超时 / DNS / 代理不通）应返回 `Unknown` 而不是 `Invalid` ——
+    ///   用户网络问题不等于账号坏了，误标失效会让人白白删掉好账号；
+    /// · 默认实现返回 `Unknown`：没实现探针的家如实说「不知道」，而不是假装有效。
+    fn probe_account<'a>(
+        &'a self,
+        _store: &'a AccountStore,
+        _account_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AccountProbe> + Send + 'a>> {
+        Box::pin(async move { AccountProbe::unknown("该提供商尚未实现凭证探针") })
     }
 
     /// 本 provider 是否允许「一个账号都没有时用默认登录态转发」
